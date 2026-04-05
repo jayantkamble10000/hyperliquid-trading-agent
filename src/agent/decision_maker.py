@@ -1,8 +1,9 @@
 """Decision-making agent that orchestrates LLM prompts and indicator lookups."""
 
+import asyncio
 import requests
 from src.config_loader import CONFIG
-from src.indicators.taapi_client import TAAPIClient
+from src.indicators.local_indicators import compute_all, last_n, latest
 import json
 import logging
 from datetime import datetime
@@ -10,7 +11,7 @@ from datetime import datetime
 class TradingAgent:
     """High-level trading agent that delegates reasoning to an LLM service."""
 
-    def __init__(self):
+    def __init__(self, hyperliquid=None):
         """Initialize LLM configuration, metadata headers, and indicator helper."""
         self.model = CONFIG["llm_model"]
         self.api_key = CONFIG["openrouter_api_key"]
@@ -18,7 +19,7 @@ class TradingAgent:
         self.base_url = f"{base}/chat/completions"
         self.referer = CONFIG.get("openrouter_referer")
         self.app_title = CONFIG.get("openrouter_app_title")
-        self.taapi = TAAPIClient()
+        self.hyperliquid = hyperliquid
         # Fast/cheap sanitizer model to normalize outputs on parse failures
         self.sanitize_model = CONFIG.get("sanitize_model") or "openai/gpt-5"
 
@@ -70,7 +71,8 @@ class TradingAgent:
             "- In high volatility (elevated ATR) or during funding spikes, reduce or avoid leverage.\n"
             "- Treat allocation_usd as notional exposure; keep it consistent with safe leverage and available margin.\n\n"
             "Tool usage\n"
-            "- Aggressively leverage fetch_taapi_indicator whenever an additional datapoint could sharpen your thesis; keep parameters minimal (indicator, symbol like \"BTC/USDT\", interval \"5m\"/\"4h\", optional period).\n"
+            "- Aggressively leverage fetch_indicator whenever an additional datapoint could sharpen your thesis; parameters: indicator (ema/sma/rsi/macd/bbands/atr/adx/obv/vwap/stoch_rsi/all), asset (e.g. \"BTC\", \"OIL\", \"GOLD\"), interval (\"5m\"/\"4h\"), optional period.\n"
+            "- Indicators are computed locally from Hyperliquid candle data — works for ALL perp markets (crypto, commodities, indices).\n"
             "- Incorporate tool findings into your reasoning, but NEVER paste raw tool responses into the final JSON—summarize the insight instead.\n"
             "- Use tools to upgrade your analysis; lack of confidence is a cue to query them before deciding."
             "Reasoning recipe (first principles)\n"
@@ -92,22 +94,21 @@ class TradingAgent:
         tools = [{
             "type": "function",
             "function": {
-                "name": "fetch_taapi_indicator",
-                "description": ("Fetch any TAAPI indicator. Available: ema, sma, rsi, macd, bbands, stochastic, stochrsi, "
-                    "adx, atr, cci, dmi, ichimoku, supertrend, vwap, obv, mfi, willr, roc, mom, sar (parabolic), "
-                    "fibonacci, pivotpoints, keltner, donchian, awesome, gator, alligator, and 200+ more. "
-                    "See https://taapi.io/indicators/ for full list and parameters."),
+                "name": "fetch_indicator",
+                "description": ("Fetch technical indicators computed locally from Hyperliquid candle data. "
+                    "Works for ALL Hyperliquid perp markets including crypto (BTC, ETH, SOL), "
+                    "commodities (OIL, GOLD, SILVER), indices (SPX), and more. "
+                    "Available indicators: ema, sma, rsi, macd, bbands, atr, adx, obv, vwap, stoch_rsi. "
+                    "Returns the latest values and recent series."),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "indicator": {"type": "string"},
-                        "symbol": {"type": "string"},
-                        "interval": {"type": "string"},
-                        "period": {"type": "integer"},
-                        "backtrack": {"type": "integer"},
-                        "other_params": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}},
+                        "indicator": {"type": "string", "enum": ["ema", "sma", "rsi", "macd", "bbands", "atr", "adx", "obv", "vwap", "stoch_rsi", "all"]},
+                        "asset": {"type": "string", "description": "Hyperliquid asset symbol, e.g. BTC, ETH, OIL, GOLD, SPX"},
+                        "interval": {"type": "string", "enum": ["1m", "5m", "15m", "1h", "4h", "1d"]},
+                        "period": {"type": "integer", "description": "Indicator period (default varies by indicator)"},
                     },
-                    "required": ["indicator", "symbol", "interval"],
+                    "required": ["indicator", "asset", "interval"],
                     "additionalProperties": False,
                 },
             },
@@ -297,33 +298,79 @@ class TradingAgent:
             tool_calls = message.get("tool_calls") or []
             if allow_tools and tool_calls:
                 for tc in tool_calls:
-                    if tc.get("type") == "function" and tc.get("function", {}).get("name") == "fetch_taapi_indicator":
+                    if tc.get("type") == "function" and tc.get("function", {}).get("name") == "fetch_indicator":
                         args = json.loads(tc["function"].get("arguments") or "{}")
                         try:
-                            params = {
-                                "secret": self.taapi.api_key,
-                                "exchange": "binance",
-                                "symbol": args["symbol"],
-                                "interval": args["interval"],
-                            }
-                            if args.get("period") is not None:
-                                params["period"] = args["period"]
-                            if args.get("backtrack") is not None:
-                                params["backtrack"] = args["backtrack"]
-                            if isinstance(args.get("other_params"), dict):
-                                params.update(args["other_params"])
-                            ind_resp = requests.get(f"{self.taapi.base_url}{args['indicator']}", params=params, timeout=30).json()
+                            asset = args["asset"]
+                            interval = args["interval"]
+                            indicator = args["indicator"]
+
+                            # Fetch candles from Hyperliquid and compute locally
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                import concurrent.futures
+                                with concurrent.futures.ThreadPoolExecutor() as pool:
+                                    candles = pool.submit(
+                                        asyncio.run,
+                                        self.hyperliquid.get_candles(asset, interval, 100)
+                                    ).result(timeout=30)
+                            else:
+                                candles = asyncio.run(self.hyperliquid.get_candles(asset, interval, 100))
+
+                            all_indicators = compute_all(candles)
+
+                            if indicator == "all":
+                                result = {k: {"latest": latest(v) if isinstance(v, list) else v,
+                                              "series": last_n(v, 10) if isinstance(v, list) else v}
+                                          for k, v in all_indicators.items()}
+                            elif indicator == "macd":
+                                result = {
+                                    "macd": {"latest": latest(all_indicators.get("macd", [])), "series": last_n(all_indicators.get("macd", []), 10)},
+                                    "signal": {"latest": latest(all_indicators.get("macd_signal", [])), "series": last_n(all_indicators.get("macd_signal", []), 10)},
+                                    "histogram": {"latest": latest(all_indicators.get("macd_histogram", [])), "series": last_n(all_indicators.get("macd_histogram", []), 10)},
+                                }
+                            elif indicator == "bbands":
+                                result = {
+                                    "upper": {"latest": latest(all_indicators.get("bbands_upper", [])), "series": last_n(all_indicators.get("bbands_upper", []), 10)},
+                                    "middle": {"latest": latest(all_indicators.get("bbands_middle", [])), "series": last_n(all_indicators.get("bbands_middle", []), 10)},
+                                    "lower": {"latest": latest(all_indicators.get("bbands_lower", [])), "series": last_n(all_indicators.get("bbands_lower", []), 10)},
+                                }
+                            elif indicator in ("ema", "sma"):
+                                period = args.get("period", 20)
+                                from src.indicators.local_indicators import ema as _ema, sma as _sma
+                                closes = [c["close"] for c in candles]
+                                series = _ema(closes, period) if indicator == "ema" else _sma(closes, period)
+                                result = {"latest": latest(series), "series": last_n(series, 10), "period": period}
+                            elif indicator == "rsi":
+                                period = args.get("period", 14)
+                                from src.indicators.local_indicators import rsi as _rsi
+                                series = _rsi(candles, period)
+                                result = {"latest": latest(series), "series": last_n(series, 10), "period": period}
+                            elif indicator == "atr":
+                                period = args.get("period", 14)
+                                from src.indicators.local_indicators import atr as _atr
+                                series = _atr(candles, period)
+                                result = {"latest": latest(series), "series": last_n(series, 10), "period": period}
+                            else:
+                                key = indicator.replace("stoch_rsi", "stoch_rsi")
+                                # Map indicator name to computed keys
+                                key_map = {"adx": "adx", "obv": "obv", "vwap": "vwap"}
+                                mapped = key_map.get(indicator, indicator)
+                                series = all_indicators.get(mapped, [])
+                                result = {"latest": latest(series) if isinstance(series, list) else series,
+                                          "series": last_n(series, 10) if isinstance(series, list) else series}
+
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tc.get("id"),
-                                "name": "fetch_taapi_indicator",
-                                "content": json.dumps(ind_resp),
+                                "name": "fetch_indicator",
+                                "content": json.dumps(result, default=str),
                             })
-                        except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError) as ex:
+                        except Exception as ex:
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tc.get("id"),
-                                "name": "fetch_taapi_indicator",
+                                "name": "fetch_indicator",
                                 "content": f"Error: {str(ex)}",
                             })
                 continue

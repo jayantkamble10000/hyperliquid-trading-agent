@@ -69,7 +69,7 @@ def _get_list(name: str, default: list[str] | None = None) -> list[str] | None:
 
 
 CONFIG = {
-    "taapi_api_key": _get_env("TAAPI_API_KEY", required=True),
+    "taapi_api_key": _get_env("TAAPI_API_KEY"),  # Optional — no longer required, indicators computed locally from HL candles
     "hyperliquid_private_key": _get_env("HYPERLIQUID_PRIVATE_KEY") or _get_env("LIGHTER_PRIVATE_KEY"),
     "mnemonic": _get_env("MNEMONIC"),
     # Hyperliquid network/base URL overrides

@@ -371,6 +371,45 @@ class HyperliquidAPI:
             logging.error("OI fetch error for %s: %s", asset, e)
             return None
 
+    async def get_candles(self, asset, interval="5m", count=100):
+        """Fetch historical candle data for any Hyperliquid perp market.
+
+        Args:
+            asset: Market symbol (e.g. "BTC", "ETH", "OIL", "GOLD", "SPX").
+            interval: Candle interval string (1m, 5m, 15m, 1h, 4h, 1d, etc.).
+            count: Number of candles to fetch (max 5000).
+
+        Returns:
+            List of dicts with keys: t, open, high, low, close, volume.
+        """
+        import time as _time
+
+        # Map interval to approximate milliseconds to compute startTime
+        interval_ms_map = {
+            "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+            "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
+            "4h": 14_400_000, "8h": 28_800_000, "12h": 43_200_000,
+            "1d": 86_400_000, "3d": 259_200_000, "1w": 604_800_000,
+        }
+        interval_ms = interval_ms_map.get(interval, 300_000)
+        end_time = int(_time.time() * 1000)
+        start_time = end_time - (count * interval_ms)
+
+        raw = await self._retry(
+            lambda: self.info.candles_snapshot(asset, interval, start_time, end_time)
+        )
+        candles = []
+        for c in raw:
+            candles.append({
+                "t": c.get("t"),
+                "open": float(c.get("o", 0)),
+                "high": float(c.get("h", 0)),
+                "low": float(c.get("l", 0)),
+                "close": float(c.get("c", 0)),
+                "volume": float(c.get("v", 0)),
+            })
+        return candles
+
     async def get_funding_rate(self, asset):
         """Return the most recent funding rate for ``asset`` if available.
 

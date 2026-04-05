@@ -5,7 +5,7 @@ import argparse
 import pathlib
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
 from src.agent.decision_maker import TradingAgent
-from src.indicators.taapi_client import TAAPIClient
+from src.indicators.local_indicators import compute_all, last_n, latest
 from src.trading.hyperliquid_api import HyperliquidAPI
 import asyncio
 import logging
@@ -64,9 +64,8 @@ def main():
     if not args.assets or not args.interval:
         parser.error("Please provide --assets and --interval, or set ASSETS and INTERVAL in .env")
 
-    taapi = TAAPIClient()
     hyperliquid = HyperliquidAPI()
-    agent = TradingAgent()
+    agent = TradingAgent(hyperliquid=hyperliquid)
 
 
     start_time = datetime.now(timezone.utc)
@@ -221,7 +220,7 @@ def main():
                 "recent_fills": recent_fills_struct,
             }
 
-            # Gather data for ALL assets first
+            # Gather data for ALL assets first (using Hyperliquid candles + local indicators)
             market_sections = []
             asset_prices = {}
             for asset in args.assets:
@@ -234,18 +233,12 @@ def main():
                     oi = await hyperliquid.get_open_interest(asset)
                     funding = await hyperliquid.get_funding_rate(asset)
 
-                    intraday_tf = "5m"
-                    ema_series = taapi.fetch_series("ema", f"{asset}/USDT", intraday_tf, results=10, params={"period": 20}, value_key="value")
-                    macd_series = taapi.fetch_series("macd", f"{asset}/USDT", intraday_tf, results=10, value_key="valueMACD")
-                    rsi7_series = taapi.fetch_series("rsi", f"{asset}/USDT", intraday_tf, results=10, params={"period": 7}, value_key="value")
-                    rsi14_series = taapi.fetch_series("rsi", f"{asset}/USDT", intraday_tf, results=10, params={"period": 14}, value_key="value")
+                    # Fetch candles from Hyperliquid and compute indicators locally
+                    candles_5m = await hyperliquid.get_candles(asset, "5m", 100)
+                    candles_4h = await hyperliquid.get_candles(asset, "4h", 100)
 
-                    lt_ema20 = taapi.fetch_value("ema", f"{asset}/USDT", "4h", params={"period": 20}, key="value")
-                    lt_ema50 = taapi.fetch_value("ema", f"{asset}/USDT", "4h", params={"period": 50}, key="value")
-                    lt_atr3 = taapi.fetch_value("atr", f"{asset}/USDT", "4h", params={"period": 3}, key="value")
-                    lt_atr14 = taapi.fetch_value("atr", f"{asset}/USDT", "4h", params={"period": 14}, key="value")
-                    lt_macd_series = taapi.fetch_series("macd", f"{asset}/USDT", "4h", results=10, value_key="valueMACD")
-                    lt_rsi_series = taapi.fetch_series("rsi", f"{asset}/USDT", "4h", results=10, params={"period": 14}, value_key="value")
+                    intra = compute_all(candles_5m)
+                    lt = compute_all(candles_4h)
 
                     recent_mids = [entry["mid"] for entry in list(price_history.get(asset, []))[-10:]]
                     funding_annualized = round(funding * 24 * 365 * 100, 2) if funding else None
@@ -254,29 +247,29 @@ def main():
                         "asset": asset,
                         "current_price": round_or_none(current_price, 2),
                         "intraday": {
-                            "ema20": round_or_none(ema_series[-1], 2) if ema_series else None,
-                            "macd": round_or_none(macd_series[-1], 2) if macd_series else None,
-                            "rsi7": round_or_none(rsi7_series[-1], 2) if rsi7_series else None,
-                            "rsi14": round_or_none(rsi14_series[-1], 2) if rsi14_series else None,
+                            "ema20": round_or_none(latest(intra.get("ema20", [])), 2),
+                            "macd": round_or_none(latest(intra.get("macd", [])), 2),
+                            "rsi7": round_or_none(latest(intra.get("rsi7", [])), 2),
+                            "rsi14": round_or_none(latest(intra.get("rsi14", [])), 2),
                             "series": {
-                                "ema20": round_series(ema_series, 2),
-                                "macd": round_series(macd_series, 2),
-                                "rsi7": round_series(rsi7_series, 2),
-                                "rsi14": round_series(rsi14_series, 2)
+                                "ema20": round_series(last_n(intra.get("ema20", []), 10), 2),
+                                "macd": round_series(last_n(intra.get("macd", []), 10), 2),
+                                "rsi7": round_series(last_n(intra.get("rsi7", []), 10), 2),
+                                "rsi14": round_series(last_n(intra.get("rsi14", []), 10), 2),
                             }
                         },
                         "long_term": {
-                            "ema20": round_or_none(lt_ema20, 2),
-                            "ema50": round_or_none(lt_ema50, 2),
-                            "atr3": round_or_none(lt_atr3, 2),
-                            "atr14": round_or_none(lt_atr14, 2),
-                            "macd_series": round_series(lt_macd_series, 2),
-                            "rsi_series": round_series(lt_rsi_series, 2)
+                            "ema20": round_or_none(latest(lt.get("ema20", [])), 2),
+                            "ema50": round_or_none(latest(lt.get("ema50", [])), 2),
+                            "atr3": round_or_none(latest(lt.get("atr3", [])), 2),
+                            "atr14": round_or_none(latest(lt.get("atr14", [])), 2),
+                            "macd_series": round_series(last_n(lt.get("macd", []), 10), 2),
+                            "rsi_series": round_series(last_n(lt.get("rsi14", []), 10), 2),
                         },
                         "open_interest": round_or_none(oi, 2),
                         "funding_rate": round_or_none(funding, 8),
                         "funding_annualized_pct": funding_annualized,
-                        "recent_mid_prices": recent_mids
+                        "recent_mid_prices": recent_mids,
                     })
                 except Exception as e:
                     add_event(f"Data gather error {asset}: {e}")
@@ -533,20 +526,22 @@ def main():
         std = math.sqrt(var) if var > 0 else 0
         return mean / std if std > 0 else 0
 
-    async def check_exit_condition(trade, taapi, hyperliquid):
+    async def check_exit_condition(trade, hyperliquid_api):
         """Evaluate whether a given trade's exit plan triggers a close."""
         plan = (trade.get("exit_plan") or "").lower()
         if not plan:
             return False
         try:
+            candles_4h = await hyperliquid_api.get_candles(trade["asset"], "4h", 60)
+            indicators = compute_all(candles_4h)
             if "macd" in plan and "below" in plan:
-                macd = taapi.get_indicators(trade["asset"], "4h")["macd"]["valueMACD"]
+                macd_val = latest(indicators.get("macd", []))
                 threshold = float(plan.split("below")[-1].strip())
-                return macd < threshold
+                return macd_val is not None and macd_val < threshold
             if "close above ema50" in plan:
-                ema50 = taapi.get_historical_indicator("ema", f"{trade['asset']}/USDT", "4h", results=1, params={"period": 50})[0]["value"]
-                current = await hyperliquid.get_current_price(trade["asset"])
-                return current > ema50
+                ema50_val = latest(indicators.get("ema50", []))
+                current = await hyperliquid_api.get_current_price(trade["asset"])
+                return ema50_val is not None and current > ema50_val
         except Exception:
             return False
         return False
