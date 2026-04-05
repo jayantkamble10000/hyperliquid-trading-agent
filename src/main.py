@@ -89,6 +89,18 @@ def main():
     async def run_loop():
         """Main trading loop that gathers data, calls the agent, and executes trades."""
         nonlocal invocation_count, initial_account_value
+
+        # Pre-load meta cache for correct order sizing
+        await hyperliquid.get_meta_and_ctxs()
+        # Pre-load HIP-3 dex meta for any dex:asset in the asset list
+        hip3_dexes = set()
+        for a in args.assets:
+            if ":" in a:
+                hip3_dexes.add(a.split(":")[0])
+        for dex in hip3_dexes:
+            await hyperliquid.get_meta_and_ctxs(dex=dex)
+            add_event(f"Loaded HIP-3 meta for dex: {dex}")
+
         while True:
             invocation_count += 1
             minutes_since_start = (datetime.now(timezone.utc) - start_time).total_seconds() / 60

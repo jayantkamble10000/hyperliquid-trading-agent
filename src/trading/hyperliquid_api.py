@@ -64,17 +64,17 @@ class HyperliquidAPI:
             else:
                 base_url = constants.MAINNET_API_URL
         self.base_url = base_url
-        # Vault address: the main wallet that holds funds.
-        # The agent wallet (private key) is just the signer.
-        self.vault_address = CONFIG.get("hyperliquid_vault_address")
-        # The address to query for state — vault if set, otherwise the signer
-        self.query_address = self.vault_address or self.wallet.address
+        # Account address: the main wallet that holds funds.
+        # The agent wallet (private key) is just the authorized signer.
+        self.account_address = CONFIG.get("hyperliquid_vault_address")
+        # The address to query for state — main account if set, otherwise the signer
+        self.query_address = self.account_address or self.wallet.address
         self._build_clients()
 
     def _build_clients(self):
         """Instantiate exchange and info client instances for the active base URL."""
         self.info = Info(self.base_url)
-        self.exchange = Exchange(self.wallet, self.base_url, vault_address=self.vault_address)
+        self.exchange = Exchange(self.wallet, self.base_url, account_address=self.account_address)
 
     def _reset_clients(self):
         """Recreate SDK clients after connection failures while logging failures."""
