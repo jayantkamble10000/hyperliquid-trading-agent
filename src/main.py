@@ -450,10 +450,16 @@ def main():
                     spread_signals = spread_engine.get_asset_spread_signals(asset)
                     quant_signals["spread_signals"] = spread_signals
 
-                    # Index quant signals for signal-quality gate in risk manager
+                    # Index quant signals for signal-quality gate in risk manager.
+                    # NOTE: composite_score and confidence_label live inside the
+                    # nested "recommendation" dict returned by compute_all_signals,
+                    # not at the top level. Run 15 post-mortem caught this — reading
+                    # the top level silently returned the defaults on every cycle,
+                    # making the gate evaluate every asset as low/0.0 regardless.
+                    _rec = quant_signals.get("recommendation", {}) or {}
                     asset_quant_lookup[asset] = {
-                        "confidence_label": quant_signals.get("confidence_label", "low"),
-                        "composite_score": quant_signals.get("composite_score", 0.0),
+                        "confidence_label": _rec.get("confidence_label", "low"),
+                        "composite_score": _rec.get("composite_score", 0.0),
                     }
 
                     recent_mids = [entry["mid"] for entry in list(price_history.get(asset, []))[-10:]]
