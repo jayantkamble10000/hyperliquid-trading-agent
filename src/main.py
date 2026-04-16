@@ -618,7 +618,18 @@ def main():
                     add_event(f"Retry traceback: {traceback.format_exc()}")
                     outputs = {}
 
-            reasoning_text = outputs.get("reasoning", "") if isinstance(outputs, dict) else ""
+            # Haiku sometimes returns reasoning as a dict (structured steps) instead
+            # of a string. Normalize to string so downstream slicing/logging works.
+            _raw_reasoning = outputs.get("reasoning", "") if isinstance(outputs, dict) else ""
+            if isinstance(_raw_reasoning, str):
+                reasoning_text = _raw_reasoning
+            elif _raw_reasoning:
+                try:
+                    reasoning_text = json.dumps(_raw_reasoning, default=str)
+                except Exception:
+                    reasoning_text = str(_raw_reasoning)
+            else:
+                reasoning_text = ""
             if reasoning_text:
                 add_event(f"LLM reasoning summary: {reasoning_text}")
 
