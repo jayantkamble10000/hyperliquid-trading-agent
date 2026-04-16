@@ -350,6 +350,115 @@ def vwap(candles: list[dict]) -> list[float | None]:
 # High-level helper: compute all standard indicators for an asset
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# SWMID (Size-Weighted Mid Price) - adapted from IMC Prosperity
+# ---------------------------------------------------------------------------
+
+def swmid(best_bid: float, best_ask: float, bid_vol: float, ask_vol: float) -> float | None:
+    """Size-weighted mid price: weights toward the less-liquid side.
+
+    From IMC Prosperity: gives a more accurate fair value than simple mid.
+    swmid = (bid * ask_vol + ask * bid_vol) / (bid_vol + ask_vol)
+    """
+    total_vol = bid_vol + ask_vol
+    if total_vol == 0:
+        return (best_bid + best_ask) / 2 if best_bid and best_ask else None
+    return (best_bid * ask_vol + best_ask * bid_vol) / total_vol
+
+
+# ---------------------------------------------------------------------------
+# Session VWAP (resets each session)
+# ---------------------------------------------------------------------------
+
+def session_vwap(candles: list[dict], session_bars: int = 48) -> list[float | None]:
+    """VWAP that resets every session_bars candles.
+
+    For 5m candles: 48 bars = 4 hours (approximating a session).
+    Fixes the original cumulative VWAP that never resets.
+    """
+    result: list[float | None] = []
+    cum_vol = 0.0
+    cum_tp_vol = 0.0
+    for i, c in enumerate(candles):
+        if i % session_bars == 0:
+            cum_vol = 0.0
+            cum_tp_vol = 0.0
+        tp = (c["high"] + c["low"] + c["close"]) / 3.0
+        cum_vol += c["volume"]
+        cum_tp_vol += tp * c["volume"]
+        if cum_vol > 0:
+            result.append(round(cum_tp_vol / cum_vol, 6))
+        else:
+            result.append(None)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Rolling Z-Score
+# ---------------------------------------------------------------------------
+
+def rolling_zscore(values: list[float], window: int = 20) -> list[float | None]:
+    """Rolling z-score: (value - rolling_mean) / rolling_std."""
+    result: list[float | None] = []
+    for i in range(len(values)):
+        if i < window - 1:
+            result.append(None)
+        else:
+            w = values[i - window + 1: i + 1]
+            mean = sum(w) / window
+            var = sum((x - mean) ** 2 for x in w) / window
+            std = math.sqrt(var) if var > 0 else 0
+            if std == 0:
+                result.append(0.0)
+            else:
+                result.append(round((values[i] - mean) / std, 4))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Bollinger %B
+# ---------------------------------------------------------------------------
+
+def bollinger_pct_b(candles: list[dict], period: int = 20, std_dev: float = 2.0) -> list[float | None]:
+    """Bollinger %B: (close - lower) / (upper - lower).
+
+    0 = at lower band, 0.5 = at middle, 1 = at upper band.
+    Values outside 0-1 indicate price outside the bands.
+    """
+    closes = _closes(candles)
+    bb = bbands(candles, period, std_dev)
+    result: list[float | None] = []
+    for i in range(len(closes)):
+        upper = bb["upper"][i]
+        lower = bb["lower"][i]
+        if upper is None or lower is None or upper == lower:
+            result.append(None)
+        else:
+            result.append(round((closes[i] - lower) / (upper - lower), 4))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# EMA Slope (rate of change of EMA)
+# ---------------------------------------------------------------------------
+
+def ema_slope(candles: list[dict], period: int = 20, lookback: int = 3) -> list[float | None]:
+    """Normalized slope of EMA over lookback bars.
+
+    Positive = rising, negative = falling. Normalized by price.
+    """
+    closes = _closes(candles)
+    ema_series = ema(closes, period)
+    result: list[float | None] = []
+    for i in range(len(ema_series)):
+        if i < lookback or ema_series[i] is None or ema_series[i - lookback] is None:
+            result.append(None)
+        else:
+            slope = (ema_series[i] - ema_series[i - lookback]) / ema_series[i - lookback]
+            result.append(round(slope * 100, 4))  # As percentage
+    return result
+
+
 def compute_all(candles: list[dict]) -> dict:
     """Compute a standard suite of indicators from candle data.
 
@@ -375,6 +484,13 @@ def compute_all(candles: list[dict]) -> dict:
     obv_series = obv(candles)
     vwap_series = vwap(candles)
 
+    # New indicators adapted from IMC Prosperity
+    bpb_series = bollinger_pct_b(candles)
+    session_vwap_series = session_vwap(candles)
+    ema20_slope = ema_slope(candles, 20, 3)
+    ema50_slope = ema_slope(candles, 50, 3)
+    price_zscore = rolling_zscore(closes, 20)
+
     return {
         "ema20": ema20_series,
         "ema50": ema50_series,
@@ -391,6 +507,12 @@ def compute_all(candles: list[dict]) -> dict:
         "adx": adx_series,
         "obv": obv_series,
         "vwap": vwap_series,
+        # New IMC-inspired indicators
+        "bollinger_pct_b": bpb_series,
+        "session_vwap": session_vwap_series,
+        "ema20_slope": ema20_slope,
+        "ema50_slope": ema50_slope,
+        "price_zscore": price_zscore,
     }
 
 

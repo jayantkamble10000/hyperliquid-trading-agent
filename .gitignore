@@ -29,3 +29,12 @@ llm_requests.log
 trading_history.log
 *.log
 diary.jsonl
+decisions.jsonl
+prompts.log
+
+# Run history (per-run logs)
+diary_run*.jsonl
+decisions_run*.jsonl
+paper_trading_output_run*.log
+llm_requests_run*.log
+prompts_run*.log

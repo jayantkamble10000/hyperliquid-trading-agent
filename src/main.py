@@ -1,4 +1,11 @@
-"""Entry-point script that wires together the trading agent, data feeds, and API."""
+"""Entry-point script that wires together the trading agent, data feeds, and API.
+
+Enhanced with IMC Prosperity quantitative strategy engine:
+- Pre-computed quantitative signals (z-scores, mean reversion, regime detection)
+- Spread/pair trading between correlated assets
+- ATR-based position sizing
+- Multi-timeframe signal alignment
+"""
 
 import sys
 import argparse
@@ -8,6 +15,10 @@ from src.agent.decision_maker import TradingAgent
 from src.indicators.local_indicators import compute_all, last_n, latest
 from src.risk_manager import RiskManager
 from src.trading.hyperliquid_api import HyperliquidAPI
+from src.trading.paper_trader import PaperTrader
+from src.strategies.quant_signals import compute_all_signals
+from src.strategies.spread_trader import SpreadTradingEngine
+from src.research.research_engine import ResearchEngine
 import asyncio
 import logging
 from collections import deque, OrderedDict
@@ -51,6 +62,7 @@ def main():
 
     # Allow assets/interval via .env (CONFIG) if CLI not provided
     from src.config_loader import CONFIG
+    _cfg = CONFIG
     assets_env = CONFIG.get("assets")
     interval_env = CONFIG.get("interval")
     if (not args.assets or len(args.assets) == 0) and assets_env:
@@ -65,10 +77,34 @@ def main():
     if not args.assets or not args.interval:
         parser.error("Please provide --assets and --interval, or set ASSETS and INTERVAL in .env")
 
-    hyperliquid = HyperliquidAPI()
+    # Choose real or paper trading based on config
+    paper_mode = _cfg.get("paper_trade", False) if isinstance(_cfg.get("paper_trade"), bool) else str(_cfg.get("paper_trade", "false")).lower() in ("1", "true", "yes", "on")
+    if paper_mode:
+        paper_balance = float(_cfg.get("paper_initial_balance", "10000"))
+        hyperliquid = PaperTrader(initial_balance=paper_balance)
+        logging.info("=" * 60)
+        logging.info("PAPER TRADING MODE — No real money, simulated execution")
+        logging.info("Initial balance: $%.2f", paper_balance)
+        logging.info("=" * 60)
+    else:
+        hyperliquid = HyperliquidAPI()
+
     agent = TradingAgent(hyperliquid=hyperliquid)
     risk_mgr = RiskManager()
 
+    # Initialize spread trading engine with configured assets
+    spread_engine = SpreadTradingEngine(
+        assets=args.assets,
+        pairs=json.loads(_cfg.get("spread_pairs") or "[]") or None
+    )
+
+    # Initialize research engine (free sources, runs before everything else)
+    use_ollama = _cfg.get("use_ollama", "true").lower() in ("1", "true", "yes", "on") \
+        if isinstance(_cfg.get("use_ollama"), str) else bool(_cfg.get("use_ollama", True))
+    research_engine = ResearchEngine(assets=args.assets, use_ollama=use_ollama)
+
+    # Strategy parameters from config
+    risk_per_trade_pct = float(_cfg.get("risk_per_trade_pct") or 1.0)
 
     start_time = datetime.now(timezone.utc)
     invocation_count = 0
@@ -77,6 +113,9 @@ def main():
     recent_events = deque(maxlen=200)
     diary_path = "diary.jsonl"
     initial_account_value = None
+    # Mandatory scale-out tracking
+    position_cycle_count = {}  # coin -> cycles open (reset when position closes)
+    scaled_out_coins = set()   # coins already scaled out on this position instance
     # Perp mid-price history sampled each loop (authoritative, avoids spot/perp basis mismatch)
     price_history = {}
 
@@ -120,9 +159,12 @@ def main():
                 pos = pos_wrap
                 coin = pos.get('coin')
                 current_px = await hyperliquid.get_current_price(coin) if coin else None
+                qty = pos.get('szi')
+                qty_float = float(qty) if qty else 0
                 positions.append({
                     "symbol": coin,
-                    "quantity": round_or_none(pos.get('szi'), 6),
+                    "direction": "LONG" if qty_float > 0 else "SHORT" if qty_float < 0 else "FLAT",
+                    "quantity": round_or_none(qty, 6),
                     "entry_price": round_or_none(pos.get('entryPx'), 2),
                     "current_price": round_or_none(current_px, 2),
                     "liquidation_price": round_or_none(pos.get('liquidationPx') or pos.get('liqPx'), 2),
@@ -161,13 +203,86 @@ def main():
             except Exception as risk_err:
                 add_event(f"Risk check error: {risk_err}")
 
+            # --- RISK: Update per-coin cycle counters and run mandatory scale-out ---
+            try:
+                open_coins_now = set()
+                for pos in state['positions']:
+                    coin = pos.get('coin')
+                    size = float(pos.get('szi') or 0)
+                    if coin and abs(size) > 0:
+                        open_coins_now.add(coin)
+                        position_cycle_count[coin] = position_cycle_count.get(coin, 0) + 1
+                # Reset counters + scaled_out flag for any coin that closed
+                for coin in list(position_cycle_count.keys()):
+                    if coin not in open_coins_now:
+                        position_cycle_count.pop(coin, None)
+                        scaled_out_coins.discard(coin)
+
+                scale_outs = risk_mgr.check_mandatory_scale_outs(
+                    state['positions'], position_cycle_count, scaled_out_coins
+                )
+                for so in scale_outs:
+                    coin = so["coin"]
+                    size = so["size"]
+                    is_long = so["is_long"]
+                    breakeven = so["breakeven_sl"]
+                    add_event(
+                        f"RISK SCALE-OUT: {coin} 50% "
+                        f"(+{so['unrealized_pct']}%, {so['cycles_held']} cycles, PnL ${so['pnl']})"
+                    )
+                    try:
+                        # Close 50% at market (opposite-side order)
+                        if is_long:
+                            await hyperliquid.place_sell_order(coin, size)
+                        else:
+                            await hyperliquid.place_buy_order(coin, size)
+                        # Cancel existing SL and replace at breakeven for remaining 50%
+                        try:
+                            await hyperliquid.cancel_all_orders(coin)
+                        except Exception:
+                            pass
+                        try:
+                            remaining = size  # remaining half equals the closed half
+                            sl_order = await hyperliquid.place_stop_loss(
+                                coin, is_long, remaining, breakeven
+                            )
+                            add_event(f"RISK SCALE-OUT: breakeven SL for {coin} at ${breakeven}")
+                        except Exception as sl_err:
+                            add_event(f"Breakeven SL place error for {coin}: {sl_err}")
+                        scaled_out_coins.add(coin)
+                        with open(diary_path, "a") as f:
+                            f.write(json.dumps({
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "asset": coin,
+                                "action": "scale_out",
+                                "unrealized_pct": so["unrealized_pct"],
+                                "cycles_held": so["cycles_held"],
+                                "pnl": so["pnl"],
+                                "breakeven_sl": breakeven,
+                            }) + "\n")
+                    except Exception as so_err:
+                        add_event(f"Scale-out error for {coin}: {so_err}")
+            except Exception as so_outer:
+                add_event(f"Scale-out check error: {so_outer}")
+
             recent_diary = []
+            consecutive_holds = 0
             try:
                 with open(diary_path, "r") as f:
                     lines = f.readlines()
                     for line in lines[-10:]:
                         entry = json.loads(line)
                         recent_diary.append(entry)
+                    # Count consecutive hold-only cycles from the end
+                    for line in reversed(lines):
+                        try:
+                            entry = json.loads(line)
+                            if entry.get("action") in ("hold", "risk_blocked"):
+                                consecutive_holds += 1
+                            else:
+                                break
+                        except Exception:
+                            continue
             except Exception:
                 pass
 
@@ -246,6 +361,8 @@ def main():
                 "balance": round_or_none(state['balance'], 2),
                 "account_value": round_or_none(account_value, 2),
                 "sharpe_ratio": round_or_none(sharpe, 3),
+                "consecutive_holds": consecutive_holds,
+                "anti_paralysis_active": consecutive_holds >= 10 and len(positions) == 0,
                 "positions": positions,
                 "active_trades": [
                     {
@@ -265,9 +382,44 @@ def main():
                 "recent_fills": recent_fills_struct,
             }
 
+            # --- RESEARCH LAYER: Run FIRST, before any analysis ---
+            research_briefing = None
+            try:
+                # Collect funding/OI for on-chain analysis
+                _funding_rates = {}
+                _open_interests = {}
+                for _asset in args.assets:
+                    try:
+                        _fr = await hyperliquid.get_funding_rate(_asset)
+                        _oi = await hyperliquid.get_open_interest(_asset)
+                        if _fr is not None:
+                            _funding_rates[_asset] = _fr
+                        if _oi is not None:
+                            _open_interests[_asset] = _oi
+                    except Exception:
+                        continue
+
+                research_briefing = await research_engine.get_briefing(
+                    funding_rates=_funding_rates,
+                    open_interests=_open_interests,
+                )
+                add_event(
+                    f"Research: {research_briefing.data_quality['total_items']} items, "
+                    f"{research_briefing.data_quality['fresh_items_24h']} fresh, "
+                    f"{len(research_briefing.risk_alerts)} alerts, "
+                    f"sentiment={research_briefing.market_sentiment['market_label']}"
+                )
+                if research_briefing.risk_alerts:
+                    for alert in research_briefing.risk_alerts:
+                        add_event(f"RESEARCH ALERT: {alert}")
+            except Exception as re_err:
+                add_event(f"Research layer error (non-fatal): {re_err}")
+
             # Gather data for ALL assets first (using Hyperliquid candles + local indicators)
             market_sections = []
             asset_prices = {}
+            asset_quant_lookup = {}  # asset -> {confidence_label, composite_score} for signal-quality gate
+            asset_candles = {}  # Store candles for quant signal computation
             for asset in args.assets:
                 try:
                     current_price = await hyperliquid.get_current_price(asset)
@@ -281,9 +433,28 @@ def main():
                     # Fetch candles from Hyperliquid and compute indicators locally
                     candles_5m = await hyperliquid.get_candles(asset, "5m", 100)
                     candles_4h = await hyperliquid.get_candles(asset, "4h", 100)
+                    asset_candles[asset] = {"5m": candles_5m, "4h": candles_4h}
 
                     intra = compute_all(candles_5m)
                     lt = compute_all(candles_4h)
+
+                    # --- QUANT SIGNALS: Compute pre-LLM quantitative signals ---
+                    quant_signals = compute_all_signals(
+                        intraday_candles=candles_5m,
+                        longterm_candles=candles_4h,
+                        account_value=account_value or 10000,
+                        risk_per_trade_pct=risk_per_trade_pct,
+                    )
+
+                    # Add spread signals for this asset
+                    spread_signals = spread_engine.get_asset_spread_signals(asset)
+                    quant_signals["spread_signals"] = spread_signals
+
+                    # Index quant signals for signal-quality gate in risk manager
+                    asset_quant_lookup[asset] = {
+                        "confidence_label": quant_signals.get("confidence_label", "low"),
+                        "composite_score": quant_signals.get("composite_score", 0.0),
+                    }
 
                     recent_mids = [entry["mid"] for entry in list(price_history.get(asset, []))[-10:]]
                     funding_annualized = round(funding * 24 * 365 * 100, 2) if funding else None
@@ -291,11 +462,16 @@ def main():
                     market_sections.append({
                         "asset": asset,
                         "current_price": round_or_none(current_price, 2),
+                        # PRE-COMPUTED QUANT SIGNALS (the main decision input)
+                        "quant_signals": quant_signals,
                         "intraday": {
                             "ema20": round_or_none(latest(intra.get("ema20", [])), 2),
                             "macd": round_or_none(latest(intra.get("macd", [])), 2),
                             "rsi7": round_or_none(latest(intra.get("rsi7", [])), 2),
                             "rsi14": round_or_none(latest(intra.get("rsi14", [])), 2),
+                            "bollinger_pct_b": round_or_none(latest(intra.get("bollinger_pct_b", [])), 4),
+                            "price_zscore": round_or_none(latest(intra.get("price_zscore", [])), 4),
+                            "ema20_slope": round_or_none(latest(intra.get("ema20_slope", [])), 4),
                             "series": {
                                 "ema20": round_series(last_n(intra.get("ema20", []), 10), 2),
                                 "macd": round_series(last_n(intra.get("macd", []), 10), 2),
@@ -308,6 +484,9 @@ def main():
                             "ema50": round_or_none(latest(lt.get("ema50", [])), 2),
                             "atr3": round_or_none(latest(lt.get("atr3", [])), 2),
                             "atr14": round_or_none(latest(lt.get("atr14", [])), 2),
+                            "ema20_slope": round_or_none(latest(lt.get("ema20_slope", [])), 4),
+                            "ema50_slope": round_or_none(latest(lt.get("ema50_slope", [])), 4),
+                            "bollinger_pct_b": round_or_none(latest(lt.get("bollinger_pct_b", [])), 4),
                             "macd_series": round_series(last_n(lt.get("macd", []), 10), 2),
                             "rsi_series": round_series(last_n(lt.get("rsi14", []), 10), 2),
                         },
@@ -320,19 +499,65 @@ def main():
                     add_event(f"Data gather error {asset}: {e}")
                     continue
 
-            # Single LLM call with all assets
+            # Update spread engine with latest prices
+            spread_engine.update_prices(asset_prices)
+
+            # Get global spread signals summary
+            all_spread_signals = spread_engine.get_all_signals()
+
+            # Build research context for LLM (compact version)
+            research_context = None
+            if research_briefing:
+                research_context = {
+                    "market_sentiment": research_briefing.market_sentiment,
+                    "risk_alerts": research_briefing.risk_alerts,
+                    "key_events": [
+                        {"event": e["sample_title"][:80], "sources": e["source_count"], "impact": e["impact"]}
+                        for e in research_briefing.key_events[:5]
+                    ],
+                    "asset_sentiment": {
+                        asset: sig["final_sentiment"]
+                        for asset, sig in research_briefing.asset_signals.items()
+                    },
+                    "macro": {
+                        "fear_greed": research_briefing.market_sentiment.get("fear_greed_index"),
+                        "fear_greed_trend": research_briefing.market_sentiment.get("fear_greed_trend"),
+                        "btc_dominance": research_briefing.macro_context.get("global_market", {}).get("btc_dominance"),
+                        "market_cap_change_24h": research_briefing.macro_context.get("global_market", {}).get("market_cap_change_24h_pct"),
+                        "trending_coins": research_briefing.macro_context.get("trending_coins", [])[:5],
+                    },
+                    "on_chain": research_briefing.on_chain_context,
+                    "data_quality": {
+                        "sources": research_briefing.data_quality.get("sources_count", 0),
+                        "fresh_ratio": research_briefing.data_quality.get("freshness_ratio", 0),
+                        "events_validated": research_briefing.data_quality.get("cross_validated_events", 0),
+                    },
+                }
+
+            # Single LLM call with all assets + quant signals + research
             context_payload = OrderedDict([
                 ("invocation", {
                     "minutes_since_start": round(minutes_since_start, 2),
                     "current_time": datetime.now(timezone.utc).isoformat(),
                     "invocation_count": invocation_count
                 }),
+                ("research", research_context),
                 ("account", dashboard),
                 ("risk_limits", risk_mgr.get_risk_summary()),
+                ("spread_signals", all_spread_signals),
                 ("market_data", market_sections),
                 ("instructions", {
                     "assets": args.assets,
-                    "requirement": "Decide actions for all assets and return a strict JSON object matching the schema."
+                    "requirement": (
+                        "STEP 1: Read the 'research' section for macro context, risk alerts, and sentiment. "
+                        "STEP 2: For each asset, READ quant_signals.recommendation. "
+                        "STEP 3: Cross-reference research sentiment with quant signals. "
+                        "  - If research shows bearish sentiment + risk alerts but quant says buy → reduce confidence or hold. "
+                        "  - If research confirms quant direction → increase confidence. "
+                        "STEP 4: Use position_sizing.suggested_usd for allocation. "
+                        "Override the recommendation ONLY with strong justification. "
+                        "Return a strict JSON object matching the schema."
+                    )
                 })
             ])
             context = json.dumps(context_payload, default=json_default)
@@ -433,6 +658,35 @@ def main():
                         if alloc_usd <= 0:
                             add_event(f"Holding {asset}: zero/negative allocation")
                             continue
+                        # Minimum trade size to prevent micro-position churn
+                        MIN_TRADE_USD = 100
+                        if alloc_usd < MIN_TRADE_USD:
+                            add_event(f"Skipping {asset}: allocation ${alloc_usd:.0f} below minimum ${MIN_TRADE_USD}")
+                            continue
+
+                        # --- RISK: Signal-quality gate (skip for positions already open) ---
+                        already_open = any(
+                            (p.get("coin") == asset and abs(float(p.get("szi") or 0)) > 0)
+                            for p in state['positions']
+                        )
+                        if not already_open:
+                            anti_par = consecutive_holds >= 10 and len(
+                                [p for p in state['positions'] if abs(float(p.get('szi') or 0)) > 0]
+                            ) == 0
+                            sig_ok, sig_reason = risk_mgr.check_signal_quality(
+                                asset, asset_quant_lookup.get(asset), anti_par
+                            )
+                            if not sig_ok:
+                                add_event(f"RISK SIGNAL-QUALITY BLOCK {asset}: {sig_reason}")
+                                with open(diary_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": asset,
+                                        "action": "risk_blocked",
+                                        "reason": sig_reason,
+                                        "original_alloc_usd": alloc_usd,
+                                    }) + "\n")
+                                continue
 
                         # --- RISK: Validate trade before execution ---
                         output["current_price"] = current_price
@@ -549,6 +803,19 @@ def main():
                     import traceback
                     add_event(f"Execution error {asset}: {e}")
                     add_event(f"Traceback: {traceback.format_exc()}")
+
+            # Paper trading: check trigger orders (TP/SL) and log performance
+            if paper_mode and hasattr(hyperliquid, 'check_trigger_orders'):
+                triggered = await hyperliquid.check_trigger_orders()
+                if triggered:
+                    for trig in triggered:
+                        add_event(f"PAPER {trig.get('orderType','')} triggered: {trig.get('coin')} at ${trig.get('triggerPx')}")
+                perf = hyperliquid.get_performance_summary()
+                add_event(
+                    f"PAPER PERFORMANCE: Balance ${perf['current_balance']}, "
+                    f"PnL ${perf['realized_pnl']} ({perf['realized_pnl_pct']}%), "
+                    f"Trades: {perf['total_trades']}, Open: {perf['open_positions']}"
+                )
 
             await asyncio.sleep(get_interval_seconds(args.interval))
 

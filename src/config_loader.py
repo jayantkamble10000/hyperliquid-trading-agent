@@ -2,9 +2,12 @@
 
 import json
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Find .env relative to the project root (parent of src/)
+_project_root = Path(__file__).resolve().parent.parent
+load_dotenv(_project_root / ".env", override=True)
 
 
 def _get_env(name: str, default: str | None = None, required: bool = False) -> str | None:
@@ -104,6 +107,22 @@ CONFIG = {
     # API server
     "api_host": _get_env("API_HOST", "0.0.0.0"),
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",
+
+    # Research layer
+    "use_ollama": _get_env("USE_OLLAMA", "true"),
+    "research_cache_ttl": _get_env("RESEARCH_CACHE_TTL", "300"),
+
+    # Quantitative strategy parameters (IMC Prosperity-inspired)
+    "risk_per_trade_pct": _get_env("RISK_PER_TRADE_PCT", "1.0"),
+    "atr_multiplier": _get_env("ATR_MULTIPLIER", "2.0"),
+    "zscore_entry_threshold": _get_env("ZSCORE_ENTRY_THRESHOLD", "2.0"),
+    "zscore_exit_threshold": _get_env("ZSCORE_EXIT_THRESHOLD", "0.5"),
+    "mean_reversion_beta": _get_env("MEAN_REVERSION_BETA", "-0.229"),
+    "spread_pairs": _get_env("SPREAD_PAIRS"),  # JSON array of pair configs
+
+    # Paper trading mode (no wallet needed)
+    "paper_trade": _get_bool("PAPER_TRADE", False),
+    "paper_initial_balance": _get_env("PAPER_INITIAL_BALANCE", "10000"),
 
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),

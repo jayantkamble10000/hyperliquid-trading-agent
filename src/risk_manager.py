@@ -127,15 +127,43 @@ class RiskManager:
 
     def enforce_stop_loss(self, sl_price: float | None, entry_price: float,
                            is_buy: bool) -> float:
-        """Ensure every trade has a stop-loss. Auto-set if missing."""
-        if sl_price is not None:
-            return sl_price
-        # Auto-set SL at mandatory_sl_pct from entry
-        sl_distance = entry_price * (self.mandatory_sl_pct / 100.0)
+        """Ensure every trade has a stop-loss within mandatory distance.
+
+        If SL is missing: auto-set at mandatory_sl_pct from entry.
+        If SL is provided but too far: cap at mandatory_sl_pct distance.
+        """
+        max_sl_distance = entry_price * (self.mandatory_sl_pct / 100.0)
+
+        if sl_price is None:
+            # No SL provided — auto-set at mandatory distance
+            if is_buy:
+                return round(entry_price - max_sl_distance, 2)
+            else:
+                return round(entry_price + max_sl_distance, 2)
+
+        # SL provided — validate it's not too far from entry
         if is_buy:
-            return round(entry_price - sl_distance, 2)
+            actual_distance = entry_price - sl_price
+            if actual_distance > max_sl_distance:
+                capped_sl = round(entry_price - max_sl_distance, 2)
+                logging.warning(
+                    "RISK: SL %.2f is %.1f%% from entry (max %.1f%%). Capping to %.2f",
+                    sl_price, (actual_distance / entry_price) * 100,
+                    self.mandatory_sl_pct, capped_sl
+                )
+                return capped_sl
         else:
-            return round(entry_price + sl_distance, 2)
+            actual_distance = sl_price - entry_price
+            if actual_distance > max_sl_distance:
+                capped_sl = round(entry_price + max_sl_distance, 2)
+                logging.warning(
+                    "RISK: SL %.2f is %.1f%% from entry (max %.1f%%). Capping to %.2f",
+                    sl_price, (actual_distance / entry_price) * 100,
+                    self.mandatory_sl_pct, capped_sl
+                )
+                return capped_sl
+
+        return sl_price
 
     # ------------------------------------------------------------------
     # Force-close losing positions
@@ -183,8 +211,134 @@ class RiskManager:
         return to_close
 
     # ------------------------------------------------------------------
-    # Composite validation — run all checks before a trade
+    # Signal-quality gate for new entries (pre-LLM in effect)
     # ------------------------------------------------------------------
+
+    def check_signal_quality(
+        self,
+        asset: str,
+        quant_signal: dict,
+        anti_paralysis_active: bool,
+        min_composite_abs: float = 0.2,
+    ) -> tuple[bool, str]:
+        """Reject low-conviction new entries. Anti-paralysis bypasses the gate.
+
+        Rejects entries where confidence_label is 'low' AND |composite_score| < min_composite_abs.
+        This catches the weakest signals while letting moderate/high-conviction trades through.
+        """
+        if anti_paralysis_active:
+            return True, ""  # anti-paralysis overrides — must enter something
+        if not quant_signal:
+            return True, ""  # no signal data — let LLM call through (backward-compat)
+        confidence = str(quant_signal.get("confidence_label") or "low").lower()
+        composite = abs(float(quant_signal.get("composite_score") or 0.0))
+        if confidence == "low" and composite < min_composite_abs:
+            return False, (
+                f"Signal too weak for {asset}: confidence={confidence}, "
+                f"|composite|={composite:.3f} < {min_composite_abs}"
+            )
+        return True, ""
+
+    # ------------------------------------------------------------------
+    # Mandatory partial scale-out on winning positions (hard-coded)
+    # ------------------------------------------------------------------
+
+    def check_mandatory_scale_outs(
+        self,
+        positions: list[dict],
+        cycle_counts_by_coin: dict,
+        already_scaled: set,
+        min_unrealized_pct: float = 0.5,
+        min_cycles_held: int = 10,
+    ) -> list[dict]:
+        """Return positions that must be partially closed (50%) due to profit trigger.
+
+        Hard-coded, runs post-LLM, cannot be overridden by the LLM.
+        Trigger: unrealized_pct >= min_unrealized_pct AND cycles_held >= min_cycles_held
+                 AND position not already scaled out.
+
+        After scale-out the caller sets SL on the remaining 50% to breakeven.
+        """
+        to_scale = []
+        for pos in positions:
+            coin = pos.get("coin") or pos.get("symbol")
+            if not coin or coin in already_scaled:
+                continue
+            entry_px = float(pos.get("entryPx") or pos.get("entry_price") or 0)
+            size = float(pos.get("szi") or pos.get("quantity") or 0)
+            pnl = float(pos.get("pnl") or pos.get("unrealized_pnl") or 0)
+            if entry_px == 0 or size == 0:
+                continue
+            notional = abs(size) * entry_px
+            if notional == 0:
+                continue
+            unrealized_pct = (pnl / notional) * 100
+            cycles_held = cycle_counts_by_coin.get(coin, 0)
+            if unrealized_pct >= min_unrealized_pct and cycles_held >= min_cycles_held:
+                logging.warning(
+                    "RISK: Mandatory scale-out %s — +%.2f%% unrealized after %d cycles",
+                    coin, unrealized_pct, cycles_held
+                )
+                to_scale.append({
+                    "coin": coin,
+                    "size": abs(size) * 0.5,
+                    "is_long": size > 0,
+                    "breakeven_sl": round(entry_px, 2),
+                    "unrealized_pct": round(unrealized_pct, 2),
+                    "cycles_held": cycles_held,
+                    "pnl": round(pnl, 2),
+                })
+        return to_scale
+
+    # ------------------------------------------------------------------
+    # Correlation-aware exposure check (adapted from IMC Prosperity)
+    # ------------------------------------------------------------------
+
+    CORRELATED_GROUPS = [
+        # Assets that tend to move together - treat as single exposure bucket
+        {"group": "major_crypto", "assets": {"BTC", "ETH", "SOL", "AVAX", "DOT", "MATIC", "LINK"}},
+        {"group": "meme_crypto", "assets": {"DOGE", "SHIB", "PEPE", "WIF", "BONK"}},
+        {"group": "defi_crypto", "assets": {"UNI", "AAVE", "MKR", "CRV", "SUSHI"}},
+    ]
+
+    def check_correlated_exposure(
+        self, asset: str, new_alloc: float, positions: list[dict], account_value: float,
+        max_group_exposure_pct: float = 50.0
+    ) -> tuple[bool, str]:
+        """Check that correlated assets don't collectively exceed safe exposure.
+
+        Adapted from IMC Prosperity: their basket strategy tracked net exposure
+        across correlated components. We apply the same principle to crypto groups.
+        """
+        # Find which group this asset belongs to
+        asset_group = None
+        for group in self.CORRELATED_GROUPS:
+            if asset in group["assets"]:
+                asset_group = group
+                break
+
+        if asset_group is None:
+            return True, ""  # Uncorrelated asset, no group check needed
+
+        # Sum existing exposure in this group
+        group_exposure = 0.0
+        for pos in positions:
+            pos_coin = pos.get("coin") or pos.get("symbol") or ""
+            if pos_coin in asset_group["assets"]:
+                qty = abs(float(pos.get("szi") or pos.get("quantity") or 0))
+                entry = float(pos.get("entryPx") or pos.get("entry_price") or 0)
+                group_exposure += qty * entry
+
+        total_group = group_exposure + new_alloc
+        max_group = account_value * (max_group_exposure_pct / 100.0)
+
+        if total_group > max_group:
+            return False, (
+                f"Correlated group '{asset_group['group']}' exposure ${total_group:.2f} "
+                f"would exceed {max_group_exposure_pct}% of account (${max_group:.2f}). "
+                f"Existing group exposure: ${group_exposure:.2f}"
+            )
+        return True, ""
 
     def validate_trade(self, trade: dict, account_state: dict,
                         initial_balance: float) -> tuple[bool, str, dict]:
@@ -219,6 +373,7 @@ class RiskManager:
         balance = float(account_state.get("balance", 0))
         positions = account_state.get("positions", [])
         is_buy = action == "buy"
+        asset = trade.get("asset", "")
 
         # 1. Daily drawdown circuit breaker
         ok, reason = self.check_daily_drawdown(account_value)
@@ -261,7 +416,19 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
-        # 7. Enforce mandatory stop-loss
+        # 7. Correlated exposure check (NEW - IMC Prosperity inspired)
+        ok, reason = self.check_correlated_exposure(asset, alloc_usd, positions, account_value)
+        if not ok:
+            # Cap to remaining group budget instead of blocking
+            logging.warning("RISK: Correlated exposure warning for %s: %s", asset, reason)
+            # Reduce allocation by 50% as compromise
+            alloc_usd = alloc_usd * 0.5
+            if alloc_usd < 11.0:
+                return False, reason, trade
+            trade = {**trade, "allocation_usd": alloc_usd}
+            logging.warning("RISK: Reduced allocation to $%.2f due to correlated exposure", alloc_usd)
+
+        # 8. Enforce mandatory stop-loss
         current_price = float(trade.get("current_price", 0))
         entry_price = current_price if current_price > 0 else 1.0
         sl_price = trade.get("sl_price")
@@ -285,4 +452,5 @@ class RiskManager:
             "max_concurrent_positions": self.max_concurrent_positions,
             "min_balance_reserve_pct": self.min_balance_reserve_pct,
             "circuit_breaker_active": self.circuit_breaker_active,
+            "correlated_groups": [g["group"] for g in self.CORRELATED_GROUPS],
         }
