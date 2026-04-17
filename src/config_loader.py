@@ -83,7 +83,7 @@ CONFIG = {
     "anthropic_api_key": _get_env("ANTHROPIC_API_KEY", required=True),
     "llm_model": _get_env("LLM_MODEL", "claude-sonnet-4-20250514"),
     "sanitize_model": _get_env("SANITIZE_MODEL", "claude-haiku-4-5-20251001"),
-    "max_tokens": _get_int("MAX_TOKENS", 4096),
+    "max_tokens": _get_int("MAX_TOKENS", 8192),  # bumped 4096→8192: Haiku 4.5 supports 8192; prior 4096 truncated mid-JSON on ~33% of cycles
     "enable_tool_calling": _get_bool("ENABLE_TOOL_CALLING", False),
 
     # Extended thinking (Claude)
