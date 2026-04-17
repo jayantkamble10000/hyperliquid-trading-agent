@@ -74,15 +74,22 @@ kept locally for post-mortems.
 | 16  | 4h+15m | **Fix gate lookup bug** (`_rec = quant_signals["recommendation"]`), re-test gate | **Gate working.** First block showed `\|composite\|=0.156` (real value, not 0.000). BTC passed gate (strong composite, Schwab catalyst), SOL blocked at 0.156. 2 entries, **2 scale-outs** (SOL +0.92%/$9.17 at cycle 10, BTC +0.57%/$5.71 at cycle 32), **final PnL +$5.42**. First double-scale-out run. New issue surfaced: 21/42 cycles had JSON parse errors (Haiku hitting max_tokens=4096, truncating mid-JSON). Gracefully defaulted to hold; scale-outs still fired (hard-coded). Fix: bump max_tokens to 8192. |
 | 17  | 2h     | **Bump max_tokens 4096→8192** — but fix landed in wrong file | **Fix didn't apply.** `decision_maker.py` used `CONFIG.get("max_tokens") or 8192` but `config_loader.py` returned 4096 as default (not None), so `4096 or 8192 = 4096`. All 7 truncations still hit exactly 4096 output tokens. 2 entries (ETH $1500 + BTC $1000), 1 block (BTC `\|composite\|=0.187 < 0.2`), 0 scale-outs, final PnL −$0.88. Real fix: change default in `config_loader.py:86` to 8192. Committed `73e06c9`. |
 | 18  | 4h+5m  | **Verify max_tokens=8192 fix in config_loader** | **Fix confirmed.** Zero `stop_reason=max_tokens` hits (was 7/21 in Run 17). 44/44 successful end_turn cycles. 2 residual parse errors — NOT truncation, different causes (malformed JSON from model, sanitizer retry then defaulted to hold; both cycles recovered). 2 entries (ETH $1k + BTC $1k), 2 blocks (BTC `\|composite\|=0.133`, SOL `\|composite\|=0.018`), **2 scale-outs** (ETH +0.58%/$5.84 at cycle ~16; BTC +0.59%/$5.92 at cycle ~37), **final PnL +$3.84**. Parse error issue shifts from truncation → occasional malformed output; needs a more robust JSON extraction strategy in a later run. |
+| 19  | 3h10m  | **Time-based scale-out floor** (25% close after 20 cycles if +0.5% not reached; no breakeven SL for time-floor trigger) | **Time-floor works as designed.** SOL hit `time_floor` at cycle 20, −0.99% unrealized (25% closed, SL left untouched — prevented further bleed). ETH profit-scaled at cycle 10, +0.51%. BTC profit-scaled at cycle 15, +0.53% (both 50% close + breakeven SL). 3 entries, 1 block (BTC cycle 1, composite=0.179 < 0.2), **3 scale-outs** (1 time_floor, 2 profit), **final PnL +$0.13 (+0.00%)**. **Parse errors: 0** (max_tokens fix still holding). Realized from scale-outs: SOL −$3.83, ETH +$2.85, BTC +$3.24 = +$2.26. Cleanest run to date — all three scale-out branches executed, zero crashes, zero parse errors. Weakness: still low trade volume (3 entries in 3h10m), and SOL entry was a poor LLM call (−3.5% almost immediately) that system managed around but couldn't undo. |
 
 ## 5. Current state of each file
 
 ### `src/risk_manager.py`
 - `validate_trade(...)` — notional, SL cap (≤5%), correlated exposure check.
-- `check_mandatory_scale_outs(positions, cycle_counts, min_unrealized_pct=0.5)`
-  — hard-coded: if a position has been held ≥10 cycles AND unrealized ≥
-  threshold, close 50% at market and move SL on the runner to breakeven.
-  Returns a list of actions for the orchestrator to execute.
+- `check_mandatory_scale_outs(positions, cycle_counts, already_scaled,
+  min_unrealized_pct=0.5, min_cycles_held=10, time_floor_cycles=20,
+  time_floor_fraction=0.25)` — hard-coded, two branches:
+  - **PRIMARY (profit-based):** if a position has been held ≥10 cycles AND
+    unrealized ≥0.5%, close 50% at market and move SL on the runner to
+    breakeven. `trigger="profit"`.
+  - **FALLBACK (time-based floor):** elif held ≥20 cycles AND +0.5% not reached,
+    close 25% at market, **no SL move** (runner retains original SL).
+    `trigger="time_floor"`. Added in Run 19 to prevent flat-market starvation.
+  - `already_scaled` set gates both branches so a position only scales once per run.
 - `check_signal_quality(asset, quant_signal, anti_paralysis_active,
   min_composite_abs=0.2)` — gates new entries: blocks when
   `confidence_label == "low"` AND `|composite_score| < min_composite_abs`.
@@ -93,8 +100,9 @@ kept locally for post-mortems.
 - Maintains `position_cycle_count = {}` and `scaled_out_coins = set()` for
   scale-out state.
 - Calls `check_mandatory_scale_outs` each cycle *before* consulting the LLM,
-  executes scale-out actions directly (50% market close + breakeven SL on the
-  runner), writes `{"action": "scale_out"}` rows to diary.
+  executes scale-out actions directly. Handles both triggers: `profit` (50%
+  close + breakeven SL on runner) and `time_floor` (25% close, no SL move).
+  Writes `{"action": "scale_out", "trigger": ...}` rows to diary.
 - Builds `asset_quant_lookup` per cycle with `{confidence_label,
   composite_score}` for the signal-quality gate.
 - Enforces signal-quality gate on proposed entries *before*
@@ -119,44 +127,45 @@ kept locally for post-mortems.
 
 ## 6. Known open issues
 
-1. **Residual JSON parse errors (~5% of cycles) from malformed model output.**
-   Truncation is fixed (max_tokens=8192 confirmed working in Run 18). Remaining
-   errors are malformed JSON (e.g. trailing commas, extra data) from the model
-   occasionally breaking JSON syntax mid-reasoning. Sanitizer retry also fails
-   because the retry prompt doesn't receive a truncated input to fix — it receives
-   empty content. Fix options: (a) regex-extract the `trade_decisions` array
-   directly from the raw output even if overall JSON is broken; (b) reduce prompt
-   length to give the model more headroom within 8192 tokens.
-2. **Flat-market starvation of scale-out (Runs 14–15, now resolved in 16).**
-   Two scale-outs fired in Run 16 when the market moved. Issue may re-surface
-   in genuinely flat windows. Queued fix: time-based scale-out floor (close a
-   fraction after K cycles regardless of PnL).
-3. **All entries fire on cycle 1 (or earliest trigger).** Nothing staggers
+1. **Residual JSON parse errors — currently dormant.** Run 18 had ~5% malformed
+   JSON cycles; **Run 19 had 0**. Issue is intermittent. Not actively blocking
+   trading — monitor going forward. If it re-surfaces, fix options: (a)
+   regex-extract the `trade_decisions` array directly from raw output even if
+   overall JSON is broken; (b) reduce prompt length for more headroom in 8192.
+2. **Low trade volume per window.** Runs 18/19 both produced only 2–3 entries
+   per 3–4h. Run 19 finished +$0.13 with 3 entries + 3 scale-outs — barely
+   positive, tape-dependent. Needs longer windows to generate more cycles, OR
+   relaxed entry gating. Candidate Run 20: 8h window (no code change).
+3. **All entries still fire on cycle 1 (or earliest trigger).** Nothing staggers
    entries across a window. Option B (staggered entries) still unimplemented.
 4. **Quant threshold (0.25) is higher than gate threshold (0.2).** Effective
    entry threshold is max(0.25 quant action, 0.2 gate) = 0.25. Gate only bites
    when LLM overrides quant's hold (anti-paralysis or narrative). Thresholds
-   should be aligned (both 0.2 or both 0.25).
+   should be aligned (both 0.2 or both 0.25). Candidate Run 21/22.
+5. **LLM can still enter a poor trade that the risk manager manages but can't
+   undo** (SOL in Run 19: −3.5% drawdown within minutes of entry, time-floor
+   did partial damage control but entry itself was low-quality). Signal-quality
+   gate is threshold-based; doesn't catch directional mis-reads.
 
 ## 7. Next experiments queued
 
-- **[RUN 19 — NEXT] Time-based scale-out floor.**
-  After K cycles held with no PnL movement (e.g. 20 cycles, ~2h), close 25% at
-  market regardless of unrealized PnL, to prevent flat-market capital starvation.
-  Implement in `risk_manager.check_mandatory_scale_outs` — add a second condition
-  branch: `elif cycles_held >= K and not already_scaled`. Threshold-based scale-out
-  still fires first if +0.5% is hit; time-based is the fallback for stagnant positions.
-  Run 4h window to see if positions that never hit +0.5% now exit partially instead
-  of sitting dead for the full window.
-- **Align quant/gate thresholds:** quant uses 0.25 to define action=buy/sell;
-  gate uses 0.2 to block. Lower quant threshold to 0.2 so they're consistent —
-  OR accept the current asymmetry (gate is redundant for quant-driven holds,
-  only bites on LLM-override proposals).
-- **Time-based scale-out floor:** after K cycles held with no PnL movement,
-  close a fraction regardless to prevent flat-market starvation.
+- **[RUN 20 — CURRENT] 8-hour window, no code changes.**
+  Run 19 proved the time-floor works and gave the cleanest run yet (zero parse
+  errors, all scale-out branches executed, +$0.13 PnL). Before changing anything
+  else, observe whether doubling the window from 3.5h → 8h compounds the small
+  wins the system has demonstrated. Pure sample-size experiment.
+- **[RUN 21 candidate] Align quant/gate thresholds.** Quant uses 0.25 to define
+  action=buy/sell; gate uses 0.2 to block. Lower quant to 0.2 so they're
+  consistent, which should let borderline-good entries through (Run 19 had
+  several composites in the 0.20–0.25 dead zone that were held).
 - **Slot-based re-entry:** free the slot after scale-out so a new asset can
   enter next cycle. Currently the runner occupies its slot indefinitely.
 - **Staggered entries (Option B):** at most one new entry per N cycles.
+- **Deferred (not proposed for near-term):** SMC / FVG / liquidity-sweep /
+  volume-profile / ICT indicators. User reviewed and declined — reasoning:
+  current bottleneck is trade volume and market opportunity, not signal count.
+  Revisit only after backtesting shows offline edge and core reliability is
+  fully proven. Documented in CLAUDE.md so future sessions don't re-propose.
 
 Pick these off one at a time, one variable per run window.
 
@@ -192,4 +201,4 @@ Pick these off one at a time, one variable per run window.
 
 ---
 
-*Last updated: Run 18 post-mortem. Next: Run 19 — time-based scale-out floor.*
+*Last updated: Run 19 post-mortem. Next: Run 20 — 8h window, no code changes (sample-size experiment).*
