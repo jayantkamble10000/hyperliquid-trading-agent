@@ -73,6 +73,7 @@ kept locally for post-mortems.
 | 15  | 4h     | **Signal-quality gate** (reject low-confidence AND `|composite|<0.2` entries, anti-paralysis bypasses) | **Gate silently broken.** Post-mortem found `asset_quant_lookup` was reading `composite_score` from the top-level dict returned by `compute_all_signals`, but those keys live inside the nested `"recommendation"` sub-dict. Every block showed `|composite|=0.000` regardless of real signal strength. LLM-cited composites (e.g. SOL +0.1784) confirmed the mismatch. Anti-paralysis still fired (bypasses gate), forcing 1 BTC entry. 0 scale-outs — BTC never went positive. Flat-market starvation third consecutive run. |
 | 16  | 4h+15m | **Fix gate lookup bug** (`_rec = quant_signals["recommendation"]`), re-test gate | **Gate working.** First block showed `\|composite\|=0.156` (real value, not 0.000). BTC passed gate (strong composite, Schwab catalyst), SOL blocked at 0.156. 2 entries, **2 scale-outs** (SOL +0.92%/$9.17 at cycle 10, BTC +0.57%/$5.71 at cycle 32), **final PnL +$5.42**. First double-scale-out run. New issue surfaced: 21/42 cycles had JSON parse errors (Haiku hitting max_tokens=4096, truncating mid-JSON). Gracefully defaulted to hold; scale-outs still fired (hard-coded). Fix: bump max_tokens to 8192. |
 | 17  | 2h     | **Bump max_tokens 4096→8192** — but fix landed in wrong file | **Fix didn't apply.** `decision_maker.py` used `CONFIG.get("max_tokens") or 8192` but `config_loader.py` returned 4096 as default (not None), so `4096 or 8192 = 4096`. All 7 truncations still hit exactly 4096 output tokens. 2 entries (ETH $1500 + BTC $1000), 1 block (BTC `\|composite\|=0.187 < 0.2`), 0 scale-outs, final PnL −$0.88. Real fix: change default in `config_loader.py:86` to 8192. Committed `73e06c9`. |
+| 18  | 4h+5m  | **Verify max_tokens=8192 fix in config_loader** | **Fix confirmed.** Zero `stop_reason=max_tokens` hits (was 7/21 in Run 17). 44/44 successful end_turn cycles. 2 residual parse errors — NOT truncation, different causes (malformed JSON from model, sanitizer retry then defaulted to hold; both cycles recovered). 2 entries (ETH $1k + BTC $1k), 2 blocks (BTC `\|composite\|=0.133`, SOL `\|composite\|=0.018`), **2 scale-outs** (ETH +0.58%/$5.84 at cycle ~16; BTC +0.59%/$5.92 at cycle ~37), **final PnL +$3.84**. Parse error issue shifts from truncation → occasional malformed output; needs a more robust JSON extraction strategy in a later run. |
 
 ## 5. Current state of each file
 
@@ -118,12 +119,14 @@ kept locally for post-mortems.
 
 ## 6. Known open issues
 
-1. **Haiku hits max_tokens=4096 mid-JSON on ~33% of cycles (Runs 16–17).**
-   Output truncates, JSON parse fails, sanitizer retry fails, cycle defaults
-   to hold. Fix was committed twice: first time wrong file (decision_maker.py
-   fallback never fires when config already returns int). **Real fix landed in
-   `config_loader.py:86` (commit `73e06c9`) — default changed to 8192.**
-   Verify next run shows `stop_reason=end_turn` on all cycles, output_tokens < 8192.
+1. **Residual JSON parse errors (~5% of cycles) from malformed model output.**
+   Truncation is fixed (max_tokens=8192 confirmed working in Run 18). Remaining
+   errors are malformed JSON (e.g. trailing commas, extra data) from the model
+   occasionally breaking JSON syntax mid-reasoning. Sanitizer retry also fails
+   because the retry prompt doesn't receive a truncated input to fix — it receives
+   empty content. Fix options: (a) regex-extract the `trade_decisions` array
+   directly from the raw output even if overall JSON is broken; (b) reduce prompt
+   length to give the model more headroom within 8192 tokens.
 2. **Flat-market starvation of scale-out (Runs 14–15, now resolved in 16).**
    Two scale-outs fired in Run 16 when the market moved. Issue may re-surface
    in genuinely flat windows. Queued fix: time-based scale-out floor (close a
@@ -137,10 +140,14 @@ kept locally for post-mortems.
 
 ## 7. Next experiments queued
 
-- **[RUN 18 — NEXT] Re-test max_tokens=8192 now that real fix is in `config_loader.py`.**
-  Run 4h window. Expected: zero `stop_reason=max_tokens`, all output_tokens < 8192.
-  Watch: does parse-error-free operation increase entry frequency? Do scale-outs
-  fire more readily with better LLM decisions on each cycle?
+- **[RUN 19 — NEXT] Time-based scale-out floor.**
+  After K cycles held with no PnL movement (e.g. 20 cycles, ~2h), close 25% at
+  market regardless of unrealized PnL, to prevent flat-market capital starvation.
+  Implement in `risk_manager.check_mandatory_scale_outs` — add a second condition
+  branch: `elif cycles_held >= K and not already_scaled`. Threshold-based scale-out
+  still fires first if +0.5% is hit; time-based is the fallback for stagnant positions.
+  Run 4h window to see if positions that never hit +0.5% now exit partially instead
+  of sitting dead for the full window.
 - **Align quant/gate thresholds:** quant uses 0.25 to define action=buy/sell;
   gate uses 0.2 to block. Lower quant threshold to 0.2 so they're consistent —
   OR accept the current asymmetry (gate is redundant for quant-driven holds,
@@ -185,4 +192,4 @@ Pick these off one at a time, one variable per run window.
 
 ---
 
-*Last updated: Run 17 post-mortem. Next: Run 18 — verify max_tokens fix in config_loader.*
+*Last updated: Run 18 post-mortem. Next: Run 19 — time-based scale-out floor.*
