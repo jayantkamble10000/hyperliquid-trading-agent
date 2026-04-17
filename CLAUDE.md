@@ -72,6 +72,7 @@ kept locally for post-mortems.
 | 14  | 3h     | Drop scale-out trigger from +1.0% → +0.5% | No position reached +0.5% in 3h. Exposed *market-dependency* of the trigger — flat chop windows produce no exits. |
 | 15  | 4h     | **Signal-quality gate** (reject low-confidence AND `|composite|<0.2` entries, anti-paralysis bypasses) | **Gate silently broken.** Post-mortem found `asset_quant_lookup` was reading `composite_score` from the top-level dict returned by `compute_all_signals`, but those keys live inside the nested `"recommendation"` sub-dict. Every block showed `|composite|=0.000` regardless of real signal strength. LLM-cited composites (e.g. SOL +0.1784) confirmed the mismatch. Anti-paralysis still fired (bypasses gate), forcing 1 BTC entry. 0 scale-outs — BTC never went positive. Flat-market starvation third consecutive run. |
 | 16  | 4h+15m | **Fix gate lookup bug** (`_rec = quant_signals["recommendation"]`), re-test gate | **Gate working.** First block showed `\|composite\|=0.156` (real value, not 0.000). BTC passed gate (strong composite, Schwab catalyst), SOL blocked at 0.156. 2 entries, **2 scale-outs** (SOL +0.92%/$9.17 at cycle 10, BTC +0.57%/$5.71 at cycle 32), **final PnL +$5.42**. First double-scale-out run. New issue surfaced: 21/42 cycles had JSON parse errors (Haiku hitting max_tokens=4096, truncating mid-JSON). Gracefully defaulted to hold; scale-outs still fired (hard-coded). Fix: bump max_tokens to 8192. |
+| 17  | 2h     | **Bump max_tokens 4096→8192** — but fix landed in wrong file | **Fix didn't apply.** `decision_maker.py` used `CONFIG.get("max_tokens") or 8192` but `config_loader.py` returned 4096 as default (not None), so `4096 or 8192 = 4096`. All 7 truncations still hit exactly 4096 output tokens. 2 entries (ETH $1500 + BTC $1000), 1 block (BTC `\|composite\|=0.187 < 0.2`), 0 scale-outs, final PnL −$0.88. Real fix: change default in `config_loader.py:86` to 8192. Committed `73e06c9`. |
 
 ## 5. Current state of each file
 
@@ -117,12 +118,12 @@ kept locally for post-mortems.
 
 ## 6. Known open issues
 
-1. **Haiku hits max_tokens=4096 mid-JSON on ~50% of cycles (Run 16).** Output
-   truncates, JSON parse fails, sanitizer retry also fails, cycle defaults to
-   hold. 21/42 cycles affected. Scale-outs still fire (hard-coded, no LLM
-   needed), but entry opportunities are missed.
-   Fix: bump `max_tokens` from 4096 → 8192 in `src/agent/decision_maker.py`
-   line 23 (or set `MAX_TOKENS=8192` in `.env`). Haiku 4.5 supports 8192.
+1. **Haiku hits max_tokens=4096 mid-JSON on ~33% of cycles (Runs 16–17).**
+   Output truncates, JSON parse fails, sanitizer retry fails, cycle defaults
+   to hold. Fix was committed twice: first time wrong file (decision_maker.py
+   fallback never fires when config already returns int). **Real fix landed in
+   `config_loader.py:86` (commit `73e06c9`) — default changed to 8192.**
+   Verify next run shows `stop_reason=end_turn` on all cycles, output_tokens < 8192.
 2. **Flat-market starvation of scale-out (Runs 14–15, now resolved in 16).**
    Two scale-outs fired in Run 16 when the market moved. Issue may re-surface
    in genuinely flat windows. Queued fix: time-based scale-out floor (close a
@@ -136,10 +137,10 @@ kept locally for post-mortems.
 
 ## 7. Next experiments queued
 
-- **[RUN 17 — NEXT] Fix max_tokens=4096 → 8192** in `decision_maker.py:23`
-  (one-line change). Run a 4-6h window. Expected: parse errors drop from 50%
-  of cycles to near-zero, giving the LLM full room to respond. Watch whether
-  trade frequency increases with more effective cycles.
+- **[RUN 18 — NEXT] Re-test max_tokens=8192 now that real fix is in `config_loader.py`.**
+  Run 4h window. Expected: zero `stop_reason=max_tokens`, all output_tokens < 8192.
+  Watch: does parse-error-free operation increase entry frequency? Do scale-outs
+  fire more readily with better LLM decisions on each cycle?
 - **Align quant/gate thresholds:** quant uses 0.25 to define action=buy/sell;
   gate uses 0.2 to block. Lower quant threshold to 0.2 so they're consistent —
   OR accept the current asymmetry (gate is redundant for quant-driven holds,
@@ -184,4 +185,4 @@ Pick these off one at a time, one variable per run window.
 
 ---
 
-*Last updated: Run 16 post-mortem. Next: fix max_tokens (Run 17).*
+*Last updated: Run 17 post-mortem. Next: Run 18 — verify max_tokens fix in config_loader.*
