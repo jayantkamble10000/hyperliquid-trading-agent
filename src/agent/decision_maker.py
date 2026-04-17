@@ -20,7 +20,7 @@ class TradingAgent:
         self.client = anthropic.Anthropic(api_key=CONFIG["anthropic_api_key"])
         self.hyperliquid = hyperliquid
         self.sanitize_model = CONFIG.get("sanitize_model") or "claude-haiku-4-5-20251001"
-        self.max_tokens = int(CONFIG.get("max_tokens") or 4096)
+        self.max_tokens = int(CONFIG.get("max_tokens") or 8192)  # bumped 4096→8192 (Run 17): Haiku 4.5 supports 8192; 4096 truncated mid-JSON on ~50% of cycles in Run 16
 
     def decide_trade(self, assets, context):
         """Decide for multiple assets in one call."""
@@ -318,7 +318,7 @@ class TradingAgent:
             try:
                 response = self.client.messages.create(
                     model=self.sanitize_model,
-                    max_tokens=2048,
+                    max_tokens=4096,  # bumped 2048→4096 (Run 17): sanitizer also needs room to normalise truncated output
                     system=(
                         "You are a strict JSON normalizer. Return ONLY a JSON object with two keys: "
                         "\"reasoning\" (string) and \"trade_decisions\" (array). "
