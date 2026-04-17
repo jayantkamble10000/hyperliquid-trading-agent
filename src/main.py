@@ -225,36 +225,40 @@ def main():
                     coin = so["coin"]
                     size = so["size"]
                     is_long = so["is_long"]
-                    breakeven = so["breakeven_sl"]
+                    breakeven = so["breakeven_sl"]  # None for time-floor trigger
+                    trigger = so.get("trigger", "profit")
+                    pct_closed = 25 if trigger == "time_floor" else 50
                     add_event(
-                        f"RISK SCALE-OUT: {coin} 50% "
-                        f"(+{so['unrealized_pct']}%, {so['cycles_held']} cycles, PnL ${so['pnl']})"
+                        f"RISK SCALE-OUT ({trigger.upper()}): {coin} {pct_closed}% "
+                        f"({so['unrealized_pct']}%, {so['cycles_held']} cycles, PnL ${so['pnl']})"
                     )
                     try:
-                        # Close 50% at market (opposite-side order)
+                        # Close fraction at market (opposite-side order)
                         if is_long:
                             await hyperliquid.place_sell_order(coin, size)
                         else:
                             await hyperliquid.place_buy_order(coin, size)
-                        # Cancel existing SL and replace at breakeven for remaining 50%
-                        try:
-                            await hyperliquid.cancel_all_orders(coin)
-                        except Exception:
-                            pass
-                        try:
-                            remaining = size  # remaining half equals the closed half
-                            sl_order = await hyperliquid.place_stop_loss(
-                                coin, is_long, remaining, breakeven
-                            )
-                            add_event(f"RISK SCALE-OUT: breakeven SL for {coin} at ${breakeven}")
-                        except Exception as sl_err:
-                            add_event(f"Breakeven SL place error for {coin}: {sl_err}")
+                        # Only move SL to breakeven for profit-triggered scale-outs
+                        if trigger == "profit" and breakeven is not None:
+                            try:
+                                await hyperliquid.cancel_all_orders(coin)
+                            except Exception:
+                                pass
+                            try:
+                                remaining = size  # remaining half equals the closed half
+                                await hyperliquid.place_stop_loss(
+                                    coin, is_long, remaining, breakeven
+                                )
+                                add_event(f"RISK SCALE-OUT: breakeven SL for {coin} at ${breakeven}")
+                            except Exception as sl_err:
+                                add_event(f"Breakeven SL place error for {coin}: {sl_err}")
                         scaled_out_coins.add(coin)
                         with open(diary_path, "a") as f:
                             f.write(json.dumps({
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                                 "asset": coin,
                                 "action": "scale_out",
+                                "trigger": trigger,
                                 "unrealized_pct": so["unrealized_pct"],
                                 "cycles_held": so["cycles_held"],
                                 "pnl": so["pnl"],

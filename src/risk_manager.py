@@ -250,14 +250,25 @@ class RiskManager:
         already_scaled: set,
         min_unrealized_pct: float = 0.5,
         min_cycles_held: int = 10,
+        time_floor_cycles: int = 20,
+        time_floor_fraction: float = 0.25,
     ) -> list[dict]:
-        """Return positions that must be partially closed (50%) due to profit trigger.
+        """Return positions that must be partially closed due to profit or time trigger.
 
         Hard-coded, runs post-LLM, cannot be overridden by the LLM.
-        Trigger: unrealized_pct >= min_unrealized_pct AND cycles_held >= min_cycles_held
-                 AND position not already scaled out.
 
-        After scale-out the caller sets SL on the remaining 50% to breakeven.
+        PRIMARY trigger (profit-based):
+            unrealized_pct >= min_unrealized_pct AND cycles_held >= min_cycles_held
+            → closes 50%, sets breakeven SL on runner.
+
+        FALLBACK trigger (time-based floor, Run 19):
+            cycles_held >= time_floor_cycles AND NOT already scaled AND profit trigger
+            NOT yet met (i.e. position is stagnant / underwater).
+            → closes time_floor_fraction (25%) at market regardless of PnL.
+            Purpose: prevent flat-market capital starvation where positions sit
+            indefinitely without ever reaching the profit threshold.
+            Breakeven SL is NOT set on the runner (position may be at a loss,
+            setting breakeven SL would immediately stop it out).
         """
         to_scale = []
         for pos in positions:
@@ -274,6 +285,8 @@ class RiskManager:
                 continue
             unrealized_pct = (pnl / notional) * 100
             cycles_held = cycle_counts_by_coin.get(coin, 0)
+
+            # PRIMARY: profit-based scale-out
             if unrealized_pct >= min_unrealized_pct and cycles_held >= min_cycles_held:
                 logging.warning(
                     "RISK: Mandatory scale-out %s — +%.2f%% unrealized after %d cycles",
@@ -287,7 +300,26 @@ class RiskManager:
                     "unrealized_pct": round(unrealized_pct, 2),
                     "cycles_held": cycles_held,
                     "pnl": round(pnl, 2),
+                    "trigger": "profit",
                 })
+
+            # FALLBACK: time-based floor — stagnant position, free up 25% of capital
+            elif cycles_held >= time_floor_cycles and unrealized_pct < min_unrealized_pct:
+                logging.warning(
+                    "RISK: Time-floor scale-out %s — %.2f%% unrealized after %d cycles (stagnant)",
+                    coin, unrealized_pct, cycles_held
+                )
+                to_scale.append({
+                    "coin": coin,
+                    "size": abs(size) * time_floor_fraction,
+                    "is_long": size > 0,
+                    "breakeven_sl": None,  # do NOT move SL — position may be at a loss
+                    "unrealized_pct": round(unrealized_pct, 2),
+                    "cycles_held": cycles_held,
+                    "pnl": round(pnl, 2),
+                    "trigger": "time_floor",
+                })
+
         return to_scale
 
     # ------------------------------------------------------------------
