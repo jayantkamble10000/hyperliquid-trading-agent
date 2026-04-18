@@ -76,6 +76,7 @@ kept locally for post-mortems.
 | 18  | 4h+5m  | **Verify max_tokens=8192 fix in config_loader** | **Fix confirmed.** Zero `stop_reason=max_tokens` hits (was 7/21 in Run 17). 44/44 successful end_turn cycles. 2 residual parse errors — NOT truncation, different causes (malformed JSON from model, sanitizer retry then defaulted to hold; both cycles recovered). 2 entries (ETH $1k + BTC $1k), 2 blocks (BTC `\|composite\|=0.133`, SOL `\|composite\|=0.018`), **2 scale-outs** (ETH +0.58%/$5.84 at cycle ~16; BTC +0.59%/$5.92 at cycle ~37), **final PnL +$3.84**. Parse error issue shifts from truncation → occasional malformed output; needs a more robust JSON extraction strategy in a later run. |
 | 19  | 3h10m  | **Time-based scale-out floor** (25% close after 20 cycles if +0.5% not reached; no breakeven SL for time-floor trigger) | **Time-floor works as designed.** SOL hit `time_floor` at cycle 20, −0.99% unrealized (25% closed, SL left untouched — prevented further bleed). ETH profit-scaled at cycle 10, +0.51%. BTC profit-scaled at cycle 15, +0.53% (both 50% close + breakeven SL). 3 entries, 1 block (BTC cycle 1, composite=0.179 < 0.2), **3 scale-outs** (1 time_floor, 2 profit), **final PnL +$0.13 (+0.00%)**. **Parse errors: 0** (max_tokens fix still holding). Realized from scale-outs: SOL −$3.83, ETH +$2.85, BTC +$3.24 = +$2.26. Cleanest run to date — all three scale-out branches executed, zero crashes, zero parse errors. Weakness: still low trade volume (3 entries in 3h10m), and SOL entry was a poor LLM call (−3.5% almost immediately) that system managed around but couldn't undo. |
 | 20  | 8h07m  | **Extended window, no code changes** — pure sample-size experiment vs Run 19 | **Longer window helped across every dimension.** 83 cycles (vs 32 in Run 19, 2.6×). 3 entries (BTC long, **ETH short**, ETH long) + 3 scale-outs (1 profit, 2 time_floor) + 1 reconcile_close (ETH runner SL hit after profit scale-out, banked +$2.44 realized). **Slot recycling confirmed** — ETH was entered, scaled, SL'd, then re-entered in same window (didn't happen in any shorter run). **First short trade in recent runs** — ETH SELL @ 2428.35 → profit scale-out at +0.59% proves Haiku can take both sides. Realized PnL +$3.27, **final account PnL +$0.93 (+0.01%)** — 7× larger than Run 19. Parse errors **0** (3-run streak). 1 websocket disconnect auto-recovered. Zero crashes. Observation: SOL composites sat in 0.20–0.25 "dead zone" all run — strong enough to pass gate, too weak for quant's action=buy/sell label (threshold asymmetry bites). Cleanest *and* most profitable paper run to date. |
+| 21  | 4h07m  | **Threshold alignment 0.25 → 0.2** in `quant_signals.py` action label (match safety gate) | **Alignment worked as designed but sample too small to judge quality.** 42 cycles. 2 entries — **both from the previously-dead 0.20–0.25 band** (ETH @ composite 0.2286, BTC @ composite 0.2474). Entry rate rose 0.375/hr → 0.50/hr vs Run 20. 1 scale-out (BTC time_floor at +0.09%, cycle 20). **Final PnL −$1.04 (−0.01%)** — first negative since Run 17. Realized −$0.04 (BTC time_floor partial); ETH runner open and underwater. Parse errors **0** (4-run streak). 2 websocket disconnects auto-recovered. 0 crashes. **Conclusion:** alignment is fishing in the right pond but 2-trade sample cannot prove quality; borderline composites 0.20–0.25 appear borderline in outcome (neither win nor disaster). Next: 8h window at 0.2 threshold to get a fair sample-size comparison vs Run 20's 8h @ 0.25. |
 
 ## 5. Current state of each file
 
@@ -150,14 +151,12 @@ kept locally for post-mortems.
 
 ## 7. Next experiments queued
 
-- **[RUN 21 — NEXT] Threshold alignment: quant action threshold 0.25 → 0.2.**
-  Run 20 confirmed SOL composites sat in the 0.20–0.25 "dead zone" the entire
-  window — strong enough to pass the safety gate, too weak for quant's action
-  label. Aligning the thresholds should surface those as `buy`/`sell` actions
-  for the LLM to consider. Safety gate stays at 0.2; only the quant action
-  threshold moves. One-line change in `src/strategies/quant_signals.py`.
-  Expected effect: more entries per window in moderate-conviction conditions.
-  Revert if it produces garbage.
+- **[RUN 22 — NEXT] 8h window at 0.2 threshold (no code changes).**
+  Run 21 (4h at 0.2) produced 2 entries, −$1.04 PnL — too small a sample to
+  decide whether the alignment helps or hurts. Run 20 had 3 entries / +$0.93 at
+  8h @ 0.25. Need apples-to-apples: 8h @ 0.2 to compare fairly. If Run 22 is
+  also negative, revert to 0.25 and try slot-based re-entry instead. If Run 22
+  is positive, keep alignment and pick the next variable.
 - **Slot-based re-entry:** free the slot after scale-out so a new asset can
   enter next cycle. Currently the runner occupies its slot indefinitely.
 - **Staggered entries (Option B):** at most one new entry per N cycles.
@@ -201,4 +200,4 @@ Pick these off one at a time, one variable per run window.
 
 ---
 
-*Last updated: Run 20 post-mortem. Next: Run 21 — align quant action threshold 0.25 → 0.2 with gate.*
+*Last updated: Run 21 post-mortem. Next: Run 22 — 8h window at 0.2 threshold for fair sample-size comparison vs Run 20 (8h @ 0.25).*
