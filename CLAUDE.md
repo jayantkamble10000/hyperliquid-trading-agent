@@ -75,6 +75,7 @@ kept locally for post-mortems.
 | 17  | 2h     | **Bump max_tokens 4096→8192** — but fix landed in wrong file | **Fix didn't apply.** `decision_maker.py` used `CONFIG.get("max_tokens") or 8192` but `config_loader.py` returned 4096 as default (not None), so `4096 or 8192 = 4096`. All 7 truncations still hit exactly 4096 output tokens. 2 entries (ETH $1500 + BTC $1000), 1 block (BTC `\|composite\|=0.187 < 0.2`), 0 scale-outs, final PnL −$0.88. Real fix: change default in `config_loader.py:86` to 8192. Committed `73e06c9`. |
 | 18  | 4h+5m  | **Verify max_tokens=8192 fix in config_loader** | **Fix confirmed.** Zero `stop_reason=max_tokens` hits (was 7/21 in Run 17). 44/44 successful end_turn cycles. 2 residual parse errors — NOT truncation, different causes (malformed JSON from model, sanitizer retry then defaulted to hold; both cycles recovered). 2 entries (ETH $1k + BTC $1k), 2 blocks (BTC `\|composite\|=0.133`, SOL `\|composite\|=0.018`), **2 scale-outs** (ETH +0.58%/$5.84 at cycle ~16; BTC +0.59%/$5.92 at cycle ~37), **final PnL +$3.84**. Parse error issue shifts from truncation → occasional malformed output; needs a more robust JSON extraction strategy in a later run. |
 | 19  | 3h10m  | **Time-based scale-out floor** (25% close after 20 cycles if +0.5% not reached; no breakeven SL for time-floor trigger) | **Time-floor works as designed.** SOL hit `time_floor` at cycle 20, −0.99% unrealized (25% closed, SL left untouched — prevented further bleed). ETH profit-scaled at cycle 10, +0.51%. BTC profit-scaled at cycle 15, +0.53% (both 50% close + breakeven SL). 3 entries, 1 block (BTC cycle 1, composite=0.179 < 0.2), **3 scale-outs** (1 time_floor, 2 profit), **final PnL +$0.13 (+0.00%)**. **Parse errors: 0** (max_tokens fix still holding). Realized from scale-outs: SOL −$3.83, ETH +$2.85, BTC +$3.24 = +$2.26. Cleanest run to date — all three scale-out branches executed, zero crashes, zero parse errors. Weakness: still low trade volume (3 entries in 3h10m), and SOL entry was a poor LLM call (−3.5% almost immediately) that system managed around but couldn't undo. |
+| 20  | 8h07m  | **Extended window, no code changes** — pure sample-size experiment vs Run 19 | **Longer window helped across every dimension.** 83 cycles (vs 32 in Run 19, 2.6×). 3 entries (BTC long, **ETH short**, ETH long) + 3 scale-outs (1 profit, 2 time_floor) + 1 reconcile_close (ETH runner SL hit after profit scale-out, banked +$2.44 realized). **Slot recycling confirmed** — ETH was entered, scaled, SL'd, then re-entered in same window (didn't happen in any shorter run). **First short trade in recent runs** — ETH SELL @ 2428.35 → profit scale-out at +0.59% proves Haiku can take both sides. Realized PnL +$3.27, **final account PnL +$0.93 (+0.01%)** — 7× larger than Run 19. Parse errors **0** (3-run streak). 1 websocket disconnect auto-recovered. Zero crashes. Observation: SOL composites sat in 0.20–0.25 "dead zone" all run — strong enough to pass gate, too weak for quant's action=buy/sell label (threshold asymmetry bites). Cleanest *and* most profitable paper run to date. |
 
 ## 5. Current state of each file
 
@@ -149,15 +150,14 @@ kept locally for post-mortems.
 
 ## 7. Next experiments queued
 
-- **[RUN 20 — CURRENT] 8-hour window, no code changes.**
-  Run 19 proved the time-floor works and gave the cleanest run yet (zero parse
-  errors, all scale-out branches executed, +$0.13 PnL). Before changing anything
-  else, observe whether doubling the window from 3.5h → 8h compounds the small
-  wins the system has demonstrated. Pure sample-size experiment.
-- **[RUN 21 candidate] Align quant/gate thresholds.** Quant uses 0.25 to define
-  action=buy/sell; gate uses 0.2 to block. Lower quant to 0.2 so they're
-  consistent, which should let borderline-good entries through (Run 19 had
-  several composites in the 0.20–0.25 dead zone that were held).
+- **[RUN 21 — NEXT] Threshold alignment: quant action threshold 0.25 → 0.2.**
+  Run 20 confirmed SOL composites sat in the 0.20–0.25 "dead zone" the entire
+  window — strong enough to pass the safety gate, too weak for quant's action
+  label. Aligning the thresholds should surface those as `buy`/`sell` actions
+  for the LLM to consider. Safety gate stays at 0.2; only the quant action
+  threshold moves. One-line change in `src/strategies/quant_signals.py`.
+  Expected effect: more entries per window in moderate-conviction conditions.
+  Revert if it produces garbage.
 - **Slot-based re-entry:** free the slot after scale-out so a new asset can
   enter next cycle. Currently the runner occupies its slot indefinitely.
 - **Staggered entries (Option B):** at most one new entry per N cycles.
@@ -201,4 +201,4 @@ Pick these off one at a time, one variable per run window.
 
 ---
 
-*Last updated: Run 19 post-mortem. Next: Run 20 — 8h window, no code changes (sample-size experiment).*
+*Last updated: Run 20 post-mortem. Next: Run 21 — align quant action threshold 0.25 → 0.2 with gate.*
