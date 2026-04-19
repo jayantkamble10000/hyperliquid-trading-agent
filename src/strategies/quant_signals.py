@@ -560,13 +560,14 @@ def _compute_recommendation(
     composite = sum(scores[k] * weights[k] for k in weights)
 
     # Action determination with confidence
-    # NOTE: threshold aligned with risk_manager signal-quality gate (0.2) as of Run 21.
-    # Previously 0.25 (asymmetric with gate), which parked 0.20–0.25 composites in a
-    # "dead zone" — strong enough to pass the gate but too weak for action label.
+    # NOTE: threshold reverted to 0.25 after Run 21–23 testing showed 0.2 produces net-negative PnL.
+    # The 0.20–0.25 "dead zone" was intentional: strong enough to pass the safety gate (0.2)
+    # but weak enough to filter out borderline-conviction trades that lose money.
+    # Runs 19–20 @ 0.25: +$1.06 PnL. Runs 21–23 @ 0.2: −$15.49 PnL.
     confidence = abs(composite)
-    if composite > 0.2:
+    if composite > 0.25:
         action = "buy"
-    elif composite < -0.2:
+    elif composite < -0.25:
         action = "sell"
     else:
         action = "hold"
