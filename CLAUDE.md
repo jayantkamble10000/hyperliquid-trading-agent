@@ -79,6 +79,7 @@ kept locally for post-mortems.
 | 21  | 4h07m  | **Threshold alignment 0.25 → 0.2** in `quant_signals.py` action label (match safety gate) | **Alignment worked as designed but sample too small to judge quality.** 42 cycles. 2 entries — **both from the previously-dead 0.20–0.25 band** (ETH @ composite 0.2286, BTC @ composite 0.2474). Entry rate rose 0.375/hr → 0.50/hr vs Run 20. 1 scale-out (BTC time_floor at +0.09%, cycle 20). **Final PnL −$1.04 (−0.01%)** — first negative since Run 17. Realized −$0.04 (BTC time_floor partial); ETH runner open and underwater. Parse errors **0** (4-run streak). 2 websocket disconnects auto-recovered. 0 crashes. **Conclusion:** alignment is fishing in the right pond but 2-trade sample cannot prove quality; borderline composites 0.20–0.25 appear borderline in outcome (neither win nor disaster). Next: 8h window at 0.2 threshold to get a fair sample-size comparison vs Run 20's 8h @ 0.25. |
 | 22  | 19h48m | **8h window at 0.2 threshold** (fair apples-to-apples vs Run 20, but overran overnight) | **REVERT THRESHOLD.** Run 22 conclusively shows 0.20 is worse than 0.25. 201 cycles, **6 entries all from 0.20–0.25 band** (previously blocked), **−$2.92 realized, −$5.65 final PnL** vs Run 20's +$3.27 realized, +$0.93 final. Across-run data: Runs 19+20 @ 0.25 = 6 entries, +$5.53 realized, +$1.06 final; Runs 21+22 @ 0.2 = 8 entries, −$2.96 realized, −$6.69 final. The 0.20–0.25 band is **actively toxic**, not merely borderline. Gate at 0.2 was designed to block garbage; lowering action threshold to 0.2 invited garbage through anyway. Revert to 0.25 with high confidence. Parse errors **0** (5-run streak). 1 websocket blip auto-recovered. 0 crashes. Next: implement slot-based re-entry (allow new asset entry after scale-out instead of runner holding slot forever). |
 | 23  | 5h50m  | **8h window at 0.2 threshold, clean network** (validate Run 22 result vs network noise) | **CONFIRMED: 0.2 threshold is bad, not network noise.** Stopped early at 5h50m on request. 180 cycles. 4 entries (all from 0.20–0.25 band), 3 time-floor scale-outs (all negative: −0.55%, −0.53%, −0.35%), 1 re-entry. **Final PnL −$8.84 (−0.09%), realized −$6.52.** Network was clean: only 1 websocket disconnect, auto-recovered (vs Run 22's multiple drops). Despite stable connectivity, Run 23 performed *worse* than Run 22 (−$8.84 vs −$5.65). This proves the 0.2 threshold is the culprit, not network. Parse errors **0** (6-run streak). **Threshold verdict:** Revert to 0.25 immediately. Implement slot-based re-entry for Run 24. |
+| 24  | 4h18m  | **0.25 threshold + slot-based re-entry** (attempt to free asset slot after scale-out) | **ABORTED: Slot-based re-entry is broken.** 177 diary entries but 45 cycles. 2 initial entries (BTC, SOL), then **42 consecutive time-floor scale-outs** across cycles 20–40+. This is symptom of the slot-release logic failing — the mechanism to prevent re-triggering scale-outs on the same coin didn't work. Result: massive PnL bleed **−$23.85 (−0.24%), −$22.41 realized** in 4.3h. Root cause: comment was added to skip `scaled_out_coins.add()` but the actual re-trigger prevention wasn't implemented. Killed early at 4h18m. Parse errors **0**. **Verdict:** Slot-based re-entry deferred. Revert to baseline 0.25 threshold for Run 25 to restore profitability. |
 
 ## 5. Current state of each file
 
@@ -153,13 +154,12 @@ kept locally for post-mortems.
 
 ## 7. Next experiments queued
 
-- **[RUN 23 — NEXT] Slot-based re-entry + revert to 0.25 threshold.**
-  Data from Runs 21–22 conclusively shows 0.20 threshold is net-negative. Revert
-  in `quant_signals.py`: action threshold back to 0.25 (one-line change).
-  Also implement slot-based re-entry: after scale-out, mark the asset slot as
-  free so a new asset can enter next cycle instead of the runner holding its
-  slot forever. This was the second-ranked candidate from post-Run-20 analysis.
-  8h window, two-line code change total.
+- **[RUN 25 — NEXT] 8h window at 0.25 threshold only (baseline restore).**
+  Run 24 revealed slot-based re-entry caused massive re-trigger bug (42
+  consecutive scale-outs on 2 entries, −$23.85 PnL). Feature is not ready.
+  Revert to proven baseline (Runs 19–20: +$1.06 PnL at 0.25). Run 25 validates
+  that 0.25 threshold alone restores profitability. Defer slot-based re-entry
+  pending proper implementation of re-trigger prevention.
 - **Slot-based re-entry:** free the slot after scale-out so a new asset can
   enter next cycle. Currently the runner occupies its slot indefinitely.
 - **Staggered entries (Option B):** at most one new entry per N cycles.
@@ -203,4 +203,4 @@ Pick these off one at a time, one variable per run window.
 
 ---
 
-*Last updated: Run 24 launched (0.25 threshold + slot-based re-entry active). Runs 19–24 form the threshold experiment + feature baseline (previously Run 22–23).*
+*Last updated: Run 24 aborted + slot-based re-entry reverted. Next: Run 25 — 0.25 threshold baseline validation.*
