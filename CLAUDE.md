@@ -80,6 +80,7 @@ kept locally for post-mortems.
 | 22  | 19h48m | **8h window at 0.2 threshold** (fair apples-to-apples vs Run 20, but overran overnight) | **REVERT THRESHOLD.** Run 22 conclusively shows 0.20 is worse than 0.25. 201 cycles, **6 entries all from 0.20–0.25 band** (previously blocked), **−$2.92 realized, −$5.65 final PnL** vs Run 20's +$3.27 realized, +$0.93 final. Across-run data: Runs 19+20 @ 0.25 = 6 entries, +$5.53 realized, +$1.06 final; Runs 21+22 @ 0.2 = 8 entries, −$2.96 realized, −$6.69 final. The 0.20–0.25 band is **actively toxic**, not merely borderline. Gate at 0.2 was designed to block garbage; lowering action threshold to 0.2 invited garbage through anyway. Revert to 0.25 with high confidence. Parse errors **0** (5-run streak). 1 websocket blip auto-recovered. 0 crashes. Next: implement slot-based re-entry (allow new asset entry after scale-out instead of runner holding slot forever). |
 | 23  | 5h50m  | **8h window at 0.2 threshold, clean network** (validate Run 22 result vs network noise) | **CONFIRMED: 0.2 threshold is bad, not network noise.** Stopped early at 5h50m on request. 180 cycles. 4 entries (all from 0.20–0.25 band), 3 time-floor scale-outs (all negative: −0.55%, −0.53%, −0.35%), 1 re-entry. **Final PnL −$8.84 (−0.09%), realized −$6.52.** Network was clean: only 1 websocket disconnect, auto-recovered (vs Run 22's multiple drops). Despite stable connectivity, Run 23 performed *worse* than Run 22 (−$8.84 vs −$5.65). This proves the 0.2 threshold is the culprit, not network. Parse errors **0** (6-run streak). **Threshold verdict:** Revert to 0.25 immediately. Implement slot-based re-entry for Run 24. |
 | 24  | 4h18m  | **0.25 threshold + slot-based re-entry** (attempt to free asset slot after scale-out) | **ABORTED: Slot-based re-entry is broken.** 177 diary entries but 45 cycles. 2 initial entries (BTC, SOL), then **42 consecutive time-floor scale-outs** across cycles 20–40+. This is symptom of the slot-release logic failing — the mechanism to prevent re-triggering scale-outs on the same coin didn't work. Result: massive PnL bleed **−$23.85 (−0.24%), −$22.41 realized** in 4.3h. Root cause: comment was added to skip `scaled_out_coins.add()` but the actual re-trigger prevention wasn't implemented. Killed early at 4h18m. Parse errors **0**. **Verdict:** Slot-based re-entry deferred. Revert to baseline 0.25 threshold for Run 25 to restore profitability. |
+| 25  | 9h46m  | **Baseline validation: 0.25 threshold only** (no new features, just confirm system is stable) | **BASELINE RESTORED.** 95 cycles, 4 entries (3 at cycle 1, 1 re-entry @ cycle 34). All 3 initial entries profit-scaled within cycle 13 at +0.83–0.88%. Realized +$16.40, **final PnL +$13.77 (+0.14%)** ✅. Across-run comparison: Runs 19–20 @ 0.25 = +$1.06 final; Runs 21–23 @ 0.2 = −$15.49 final; Run 24 @ 0.25+broken-slot = −$23.85 final; **Run 25 @ 0.25 clean = +$13.77 final.** Proof that 0.25 is correct baseline, slot-based re-entry was the culprit. Natural slot recycling occurred (ETH re-entry at cycle 34 without broken feature). Parse errors **0** (7-run streak). 1 websocket disconnect auto-recovered. 0 crashes. **Verdict:** System is stable, profitable at 0.25 threshold. Ready for next feature (longer window, funding-rate signal, or staggered entries). |
 
 ## 5. Current state of each file
 
@@ -154,12 +155,13 @@ kept locally for post-mortems.
 
 ## 7. Next experiments queued
 
-- **[RUN 25 — NEXT] 8h window at 0.25 threshold only (baseline restore).**
-  Run 24 revealed slot-based re-entry caused massive re-trigger bug (42
-  consecutive scale-outs on 2 entries, −$23.85 PnL). Feature is not ready.
-  Revert to proven baseline (Runs 19–20: +$1.06 PnL at 0.25). Run 25 validates
-  that 0.25 threshold alone restores profitability. Defer slot-based re-entry
-  pending proper implementation of re-trigger prevention.
+- **[RUN 26 — NEXT] Pick next feature from queue:**
+  Run 25 validated baseline (0.25 threshold is stable + profitable). Candidates:
+  (a) **Longer window (12h)** — test if more cycles compound small wins.
+  (b) **Funding-rate signal (read-only prompt data)** — crypto-native mean-reversion
+      signal; no risk, just inform LLM of extreme funding to improve entries.
+  (c) **Staggered entries** — limit to 1 new entry per N cycles to smooth capital deployment.
+  Recommend (b) funding-rate signal: lowest risk, highest info value, proven on crypto.
 - **Slot-based re-entry:** free the slot after scale-out so a new asset can
   enter next cycle. Currently the runner occupies its slot indefinitely.
 - **Staggered entries (Option B):** at most one new entry per N cycles.
@@ -203,4 +205,4 @@ Pick these off one at a time, one variable per run window.
 
 ---
 
-*Last updated: Run 24 aborted + slot-based re-entry reverted. Next: Run 25 — 0.25 threshold baseline validation.*
+*Last updated: Run 25 post-mortem. Baseline restored (0.25 threshold, +$13.77). Next: Run 26 — pick feature from queue (funding-rate signal recommended).*
