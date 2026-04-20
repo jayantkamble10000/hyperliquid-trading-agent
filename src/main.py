@@ -212,9 +212,7 @@ def main():
                     if coin and abs(size) > 0:
                         open_coins_now.add(coin)
                         position_cycle_count[coin] = position_cycle_count.get(coin, 0) + 1
-                # Reset counters + scaled_out flag for any coin that closed OR was scaled out
-                # NOTE (Run 24): Slot-based re-entry — after a scale-out, the asset slot is freed
-                # so a new entry can occur next cycle, even if the runner is still open.
+                # Reset counters + scaled_out flag for any coin that closed
                 for coin in list(position_cycle_count.keys()):
                     if coin not in open_coins_now:
                         position_cycle_count.pop(coin, None)
@@ -254,9 +252,7 @@ def main():
                                 add_event(f"RISK SCALE-OUT: breakeven SL for {coin} at ${breakeven}")
                             except Exception as sl_err:
                                 add_event(f"Breakeven SL place error for {coin}: {sl_err}")
-                        # Slot-based re-entry: do NOT mark as scaled_out — free the slot immediately
-                        # so a new entry can occur next cycle (even if the runner is still open).
-                        # This is the feature tested in Run 24.
+                        scaled_out_coins.add(coin)
                         with open(diary_path, "a") as f:
                             f.write(json.dumps({
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
